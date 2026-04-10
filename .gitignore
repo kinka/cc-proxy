@@ -1,0 +1,7 @@
+target/
+
+config/*.local.yaml
+config/proxy.yaml
+config/proxy.internal-chat.yaml
+
+*.log

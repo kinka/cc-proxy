@@ -1,0 +1,14 @@
+listen:
+  host: 0.0.0.0
+  port: 15721
+
+upstream:
+  base_url: "https://your-openai-compatible-endpoint.example.com"
+  api_key: "replace-me"
+  api_format: "openai_chat"
+  timeout_secs: 600
+  prompt_cache_key: "claude-code"
+  model_map:
+    claude-sonnet-4-20250514: "gpt-5"
+    claude-opus-4-20250514: "gpt-5"
+  extra_headers: {}
