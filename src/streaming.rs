@@ -112,7 +112,11 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                         has_sent_message_start = true;
                     }
 
-                    if let Some(reasoning) = &choice.delta.reasoning {
+                    // Support both reasoning and reasoning_content fields
+                    let reasoning_text = choice.delta.reasoning.as_ref()
+                        .or(choice.delta.reasoning_content.as_ref());
+
+                    if let Some(reasoning) = reasoning_text {
                         if current_non_tool_block_type != Some("thinking") {
                             if let Some(index) = current_non_tool_block_index.take() {
                                 let event = json!({ "type": "content_block_stop", "index": index });

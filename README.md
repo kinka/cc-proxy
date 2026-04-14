@@ -158,7 +158,7 @@ CONFIG_PATH=./config/gpt.yaml SKIP_REAL_REQUEST=1 ./scripts/test.sh
 Point Claude Code at the local proxy:
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:15721
+export ANTHROPIC_BASE_URL=http://127.0.0.1:25721
 export ANTHROPIC_AUTH_TOKEN=PROXY_MANAGED
 ```
 

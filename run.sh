@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTAINER_NAME="cc-proxy"
 HOST_PORT="${HOST_PORT:-25721}"
-CONTAINER_PORT="${CONTAINER_PORT:-15721}"
+CONTAINER_PORT="${CONTAINER_PORT:-25721}"
 IMAGE_TAG="${IMAGE_TAG:-}"
 RUST_LOG="${RUST_LOG:-info}"
 

@@ -107,10 +107,9 @@ pub fn anthropic_to_openai(body: Value, cache_key: Option<&str>) -> anyhow::Resu
         result["stream"] = stream.clone();
     }
 
-    if supports_reasoning_effort(model) {
-        if let Some(effort) = resolve_reasoning_effort(&body) {
-            result["reasoning_effort"] = json!(effort);
-        }
+    // Always try to pass reasoning_effort if thinking is requested
+    if let Some(effort) = resolve_reasoning_effort(&body) {
+        result["reasoning_effort"] = json!(effort);
     }
 
     if let Some(tools) = body.get("tools").and_then(|value| value.as_array()) {
@@ -163,6 +162,16 @@ pub fn openai_to_anthropic(body: Value) -> anyhow::Result<Value> {
 
     let mut content = Vec::new();
     let mut has_tool_use = false;
+
+    // Handle reasoning_content from OpenAI response
+    if let Some(reasoning) = message.get("reasoning_content").and_then(|v| v.as_str()) {
+        if !reasoning.is_empty() {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": reasoning
+            }));
+        }
+    }
 
     if let Some(message_content) = message.get("content") {
         if let Some(text) = message_content.as_str() {
@@ -410,6 +419,8 @@ pub struct Delta {
     pub content: Option<String>,
     #[serde(default)]
     pub reasoning: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
     #[serde(default)]
     pub tool_calls: Option<Vec<DeltaToolCall>>,
 }

@@ -29,5 +29,5 @@ WORKDIR /app
 COPY --from=builder /app/target/release/cc-proxy /usr/local/bin/cc-proxy
 COPY config/proxy.example.yaml /app/config/proxy.example.yaml
 
-EXPOSE 15721
+EXPOSE 25721
 CMD ["cc-proxy", "--config", "/app/config/proxy.yaml"]
