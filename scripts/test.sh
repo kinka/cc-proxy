@@ -3,9 +3,19 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_TAG="${IMAGE_TAG:-cc-proxy:latest}"
-PORT="${PORT:-15721}"
+PORT="${PORT:-25721}"
 CONTAINER_NAME="${CONTAINER_NAME:-cc-proxy-smoke}"
+
+if [ -z "${IMAGE_TAG:-}" ]; then
+    CURRENT_ARCH="$(uname -m)"
+    if [ "$CURRENT_ARCH" = "arm64" ] || [ "$CURRENT_ARCH" = "aarch64" ]; then
+        IMAGE_TAG="cc-proxy:arm64"
+    elif [ "$CURRENT_ARCH" = "x86_64" ] || [ "$CURRENT_ARCH" = "amd64" ]; then
+        IMAGE_TAG="cc-proxy:amd64"
+    else
+        IMAGE_TAG="cc-proxy:latest"
+    fi
+fi
 
 if [ -z "${CONFIG_PATH:-}" ]; then
     for candidate in \

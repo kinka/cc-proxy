@@ -47,7 +47,9 @@ build_for_arch() {
     local arch="$1"
     local platform="$2"
 
-    echo "  [${arch^^}] docker build --platform ${platform}"
+    local arch_label
+    arch_label="$(printf '%s' "$arch" | tr '[:lower:]' '[:upper:]')"
+    echo "  [${arch_label}] docker build --platform ${platform}"
     docker build \
         --platform "$platform" \
         --build-arg CARGO_HTTP_TIMEOUT="$CARGO_HTTP_TIMEOUT" \

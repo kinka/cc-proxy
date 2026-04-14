@@ -4,9 +4,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONTAINER_NAME="cc-proxy"
-HOST_PORT="${HOST_PORT:-15721}"
+HOST_PORT="${HOST_PORT:-25721}"
 CONTAINER_PORT="${CONTAINER_PORT:-15721}"
 IMAGE_TAG="${IMAGE_TAG:-}"
+RUST_LOG="${RUST_LOG:-info}"
 
 if [ -z "${CONFIG_PATH:-}" ]; then
     for candidate in \
@@ -46,14 +47,16 @@ RUN_ARGS=(
     -d
     --name "$CONTAINER_NAME"
     --restart unless-stopped
-    -p "127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}"
+    -p "${HOST_PORT}:${CONTAINER_PORT}"
     -v "${CONFIG_PATH}:/app/config/proxy.yaml:ro"
-    --add-host host.docker.internal:host-gateway
 )
 
-if [ -n "${RUST_LOG:-}" ]; then
-    RUN_ARGS+=(-e "RUST_LOG=${RUST_LOG}")
+DOCKER_VERSION_TEXT="$(docker version 2>/dev/null || true)"
+if [[ "$DOCKER_VERSION_TEXT" != *"Podman Engine"* ]]; then
+    RUN_ARGS+=(--add-host host.docker.internal:host-gateway)
 fi
+
+RUN_ARGS+=( -e "RUST_LOG=${RUST_LOG}" )
 
 if [ -n "${HTTP_PROXY:-}" ]; then
     RUN_ARGS+=(-e "HTTP_PROXY=${HTTP_PROXY}")
@@ -72,4 +75,6 @@ docker run "${RUN_ARGS[@]}" "$IMAGE_TAG" >/dev/null
 echo "Started ${CONTAINER_NAME}"
 echo "Image: ${IMAGE_TAG}"
 echo "Config: ${CONFIG_PATH}"
-echo "Endpoint: http://127.0.0.1:${HOST_PORT}"
+echo "Endpoint: http://0.0.0.0:${HOST_PORT}"
+echo "Recent logs:"
+docker logs --tail 20 "$CONTAINER_NAME" 2>&1 || true
