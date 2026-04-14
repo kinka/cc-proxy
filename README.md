@@ -141,6 +141,18 @@ Or target a specific config:
 CONFIG_PATH=./config/proxy.local.yaml ./scripts/test.sh
 ```
 
+To validate a real upstream request with `config/gpt.yaml`:
+
+```bash
+CONFIG_PATH=./config/gpt.yaml ./scripts/test.sh
+```
+
+If you only want the local `/health` check:
+
+```bash
+CONFIG_PATH=./config/gpt.yaml SKIP_REAL_REQUEST=1 ./scripts/test.sh
+```
+
 ## Claude Code
 
 Point Claude Code at the local proxy:

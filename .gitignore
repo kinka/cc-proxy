@@ -5,3 +5,4 @@ config/proxy.yaml
 config/proxy.internal-chat.yaml
 
 *.log
+.claude/
