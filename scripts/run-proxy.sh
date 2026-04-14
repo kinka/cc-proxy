@@ -8,6 +8,7 @@ HOST_PORT="${HOST_PORT:-25721}"
 CONTAINER_PORT="${CONTAINER_PORT:-15721}"
 IMAGE_TAG="${IMAGE_TAG:-}"
 RUST_LOG="${RUST_LOG:-info}"
+SKIP_REAL_REQUEST="${SKIP_REAL_REQUEST:-0}"
 
 if [ -z "${CONFIG_PATH:-}" ]; then
     for candidate in \
@@ -47,7 +48,7 @@ RUN_ARGS=(
     -d
     --name "$CONTAINER_NAME"
     --restart unless-stopped
-    -p "127.0.0.1:${HOST_PORT}:${CONTAINER_PORT}"
+    -p "${HOST_PORT}:${CONTAINER_PORT}"
     -v "${CONFIG_PATH}:/app/config/proxy.yaml:ro"
 )
 
@@ -76,5 +77,57 @@ echo "Started ${CONTAINER_NAME}"
 echo "Image: ${IMAGE_TAG}"
 echo "Config: ${CONFIG_PATH}"
 echo "Endpoint: http://127.0.0.1:${HOST_PORT}"
+
+REQUEST_URL="http://127.0.0.1:${HOST_PORT}/v1/messages"
+REQUEST_PAYLOAD='{
+  "model": "claude-sonnet-4-20250514",
+  "max_tokens": 16,
+  "messages": [
+    {
+      "role": "user",
+      "content": "reply with exactly OK"
+    }
+  ]
+}'
+
+echo "Waiting for service to be ready..."
+ready=false
+for _ in $(seq 1 20); do
+    if curl -fsS "http://127.0.0.1:${HOST_PORT}/health" >/dev/null 2>&1; then
+        ready=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "$ready" != true ]; then
+    echo "Health check failed" >&2
+    docker logs --tail 20 "$CONTAINER_NAME" 2>&1 || true
+    exit 1
+fi
+
+echo "Service ready"
+
+if [ "$SKIP_REAL_REQUEST" != "1" ]; then
+    echo "Verifying /v1/messages endpoint..."
+    response_file="$(mktemp)"
+    http_code="$(curl -sS -o "$response_file" -w '%{http_code}' \
+        -X POST "$REQUEST_URL" \
+        -H 'content-type: application/json' \
+        -d "$REQUEST_PAYLOAD" 2>/dev/null || echo "000")"
+    response_body="$(cat "$response_file" 2>/dev/null || echo "")"
+    rm -f "$response_file"
+
+    if [ "$http_code" = "200" ] && printf '%s' "$response_body" | grep -q '"id"' 2>/dev/null; then
+        echo "✓ /v1/messages endpoint verified"
+    else
+        echo "⚠ /v1/messages verification failed (HTTP $http_code)" >&2
+        if [ -n "$response_body" ]; then
+            echo "Response: ${response_body:0:200}..." >&2
+        fi
+    fi
+fi
+
+echo
 echo "Recent logs:"
 docker logs -f "$CONTAINER_NAME" 2>&1 || true
