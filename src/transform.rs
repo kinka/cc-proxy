@@ -48,6 +48,109 @@ pub fn resolve_reasoning_effort(body: &Value) -> Option<&'static str> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolResultPart {
+    Text(String),
+    Image { data_url: String },
+}
+
+pub(crate) fn image_source_to_data_url(source: &Value) -> Option<String> {
+    let media_type = source
+        .get("media_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("image/png");
+    let data = source
+        .get("data")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+
+    if data.is_empty() {
+        None
+    } else {
+        Some(format!("data:{media_type};base64,{data}"))
+    }
+}
+
+pub(crate) fn normalize_tool_result_content(content: Option<&Value>) -> anyhow::Result<Vec<ToolResultPart>> {
+    match content {
+        None => Ok(Vec::new()),
+        Some(Value::String(text)) => Ok(vec![ToolResultPart::Text(text.clone())]),
+        Some(Value::Array(blocks)) => {
+            let mut parts = Vec::new();
+
+            for block in blocks {
+                match block.get("type").and_then(|value| value.as_str()).unwrap_or("") {
+                    "text" => {
+                        if let Some(text) = block.get("text").and_then(|value| value.as_str()) {
+                            parts.push(ToolResultPart::Text(text.to_string()));
+                        }
+                    }
+                    "image" => {
+                        if let Some(source) = block.get("source") {
+                            if let Some(data_url) = image_source_to_data_url(source) {
+                                parts.push(ToolResultPart::Image { data_url });
+                            } else {
+                                parts.push(ToolResultPart::Text(serde_json::to_string(block)?));
+                            }
+                        } else {
+                            parts.push(ToolResultPart::Text(serde_json::to_string(block)?));
+                        }
+                    }
+                    _ => parts.push(ToolResultPart::Text(serde_json::to_string(block)?)),
+                }
+            }
+
+            Ok(parts)
+        }
+        Some(other) => Ok(vec![ToolResultPart::Text(serde_json::to_string(other)?)]),
+    }
+}
+
+pub(crate) fn tool_result_parts_contain_image(parts: &[ToolResultPart]) -> bool {
+    parts.iter()
+        .any(|part| matches!(part, ToolResultPart::Image { .. }))
+}
+
+pub(crate) fn tool_result_parts_to_text(parts: &[ToolResultPart]) -> Option<String> {
+    if tool_result_parts_contain_image(parts) {
+        return None;
+    }
+
+    Some(
+        parts.iter()
+            .map(|part| match part {
+                ToolResultPart::Text(text) => text.as_str(),
+                ToolResultPart::Image { .. } => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+    )
+}
+
+pub(crate) fn tool_result_parts_to_openai_chat_content(parts: &[ToolResultPart]) -> Vec<Value> {
+    parts.iter()
+        .map(|part| match part {
+            ToolResultPart::Text(text) => json!({ "type": "text", "text": text }),
+            ToolResultPart::Image { data_url } => json!({
+                "type": "image_url",
+                "image_url": { "url": data_url },
+            }),
+        })
+        .collect()
+}
+
+pub(crate) fn tool_result_parts_to_responses_content(parts: &[ToolResultPart]) -> Vec<Value> {
+    parts.iter()
+        .map(|part| match part {
+            ToolResultPart::Text(text) => json!({ "type": "input_text", "text": text }),
+            ToolResultPart::Image { data_url } => json!({
+                "type": "input_image",
+                "image_url": data_url,
+            }),
+        })
+        .collect()
+}
+
 pub fn anthropic_to_openai(body: Value, cache_key: Option<&str>) -> anyhow::Result<Value> {
     let mut result = json!({});
 
@@ -304,18 +407,12 @@ fn convert_message_to_openai(role: &str, content: Option<&Value>) -> anyhow::Res
                 }
                 "image" => {
                     if let Some(source) = block.get("source") {
-                        let media_type = source
-                            .get("media_type")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("image/png");
-                        let data = source
-                            .get("data")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("");
-                        content_parts.push(json!({
-                            "type": "image_url",
-                            "image_url": { "url": format!("data:{media_type};base64,{data}") },
-                        }));
+                        if let Some(data_url) = image_source_to_data_url(source) {
+                            content_parts.push(json!({
+                                "type": "image_url",
+                                "image_url": { "url": data_url },
+                            }));
+                        }
                     }
                 }
                 "tool_use" => {
@@ -332,15 +429,16 @@ fn convert_message_to_openai(role: &str, content: Option<&Value>) -> anyhow::Res
                     }));
                 }
                 "tool_result" => {
-                    let text = match block.get("content") {
-                        Some(Value::String(text)) => text.clone(),
-                        Some(other) => serde_json::to_string(other)?,
-                        None => String::new(),
+                    let parts = normalize_tool_result_content(block.get("content"))?;
+                    let content = if let Some(text) = tool_result_parts_to_text(&parts) {
+                        json!(text)
+                    } else {
+                        json!(tool_result_parts_to_openai_chat_content(&parts))
                     };
                     result.push(json!({
                         "role": "tool",
                         "tool_call_id": block.get("tool_use_id").and_then(|value| value.as_str()).unwrap_or(""),
-                        "content": text,
+                        "content": content,
                     }));
                 }
                 "thinking" => {}
@@ -464,4 +562,97 @@ pub struct PromptTokensDetails {
 
 pub fn extract_cache_read_tokens(usage: &Usage) -> Option<u32> {
     usage.prompt_tokens_details.as_ref().map(|details| details.cached_tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_user_image_maps_to_image_url() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "YWJj"
+                    }
+                }]
+            }]
+        });
+
+        let converted = anthropic_to_openai(body, None).unwrap();
+        let messages = converted.get("messages").and_then(Value::as_array).unwrap();
+        assert_eq!(messages[0]["content"][0]["type"], "image_url");
+        assert_eq!(messages[0]["content"][0]["image_url"]["url"], "data:image/png;base64,YWJj");
+    }
+
+    #[test]
+    fn tool_result_with_text_and_image_stays_structured_for_chat() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Read",
+                        "input": {"file_path": "a.png"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "text", "text": "截图如下"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "YWJj"
+                                }
+                            }
+                        ]
+                    }]
+                }
+            ]
+        });
+
+        let converted = anthropic_to_openai(body, None).unwrap();
+        let messages = converted.get("messages").and_then(Value::as_array).unwrap();
+        let tool_message = messages.iter().find(|message| message["role"] == "tool").unwrap();
+        let content = tool_message.get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "截图如下");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,YWJj");
+    }
+
+    #[test]
+    fn text_only_tool_result_stays_plain_text_for_chat() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "plain text"
+                }]
+            }]
+        });
+
+        let converted = anthropic_to_openai(body, None).unwrap();
+        let messages = converted.get("messages").and_then(Value::as_array).unwrap();
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["content"], "plain text");
+    }
 }

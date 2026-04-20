@@ -1,5 +1,6 @@
 use crate::sse::strip_sse_field;
 use crate::transform_responses::{build_anthropic_usage_from_responses, map_responses_stop_reason};
+use crate::{log_request_done, RequestLogContext, ResponseLogSummary};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -7,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    request_context: RequestLogContext,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
@@ -21,6 +23,8 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
         let mut current_text_index: Option<u32> = None;
         let mut tool_index_by_item_id: HashMap<String, u32> = HashMap::new();
         let mut last_tool_index: Option<u32> = None;
+        let mut saw_thinking = false;
+        let mut logged_completion = false;
         let mut sent_message_stop = false;
 
         tokio::pin!(stream);
@@ -29,6 +33,14 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
             let bytes = match chunk {
                 Ok(bytes) => bytes,
                 Err(err) => {
+                    log::error!(
+                        "request.error req_id={} path={} stage=stream_chunk api_format={} stream=true latency_ms={} error={}",
+                        request_context.req_id,
+                        request_context.path,
+                        request_context.api_format,
+                        request_context.started_at.elapsed().as_millis(),
+                        err,
+                    );
                     yield Err(std::io::Error::other(err.to_string()));
                     continue;
                 }
@@ -239,6 +251,7 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                         else {
                             continue;
                         };
+                        saw_thinking = true;
 
                         let index = resolve_content_index(
                             &data,
@@ -293,6 +306,32 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                         if !sent_message_stop {
                             yield Ok(Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
                             sent_message_stop = true;
+                        }
+
+                        if !logged_completion {
+                            let usage = build_anthropic_usage_from_responses(response.get("usage"));
+                            log_request_done(
+                                &request_context,
+                                reqwest::StatusCode::OK,
+                                &ResponseLogSummary {
+                                    response_id: message_id.clone(),
+                                    response_model: current_model.clone(),
+                                    stop_reason: map_responses_stop_reason(
+                                        response.get("status").and_then(|value| value.as_str()),
+                                        has_tool_use,
+                                        response.pointer("/incomplete_details/reason").and_then(|value| value.as_str()),
+                                    )
+                                    .map(str::to_string),
+                                    input_tokens: usage.get("input_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
+                                    output_tokens: usage.get("output_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
+                                    cache_read_input_tokens: usage.get("cache_read_input_tokens").and_then(|value| value.as_u64()),
+                                    cache_creation_input_tokens: usage.get("cache_creation_input_tokens").and_then(|value| value.as_u64()),
+                                    has_tool_use,
+                                    has_thinking: saw_thinking,
+                                },
+                                true,
+                            );
+                            logged_completion = true;
                         }
                     }
                     _ => {}

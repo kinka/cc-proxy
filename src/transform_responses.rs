@@ -307,18 +307,12 @@ fn convert_messages_to_input(messages: &[Value]) -> anyhow::Result<Vec<Value>> {
                         }
                         "image" => {
                             if let Some(source) = block.get("source") {
-                                let media_type = source
-                                    .get("media_type")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("image/png");
-                                let data = source
-                                    .get("data")
-                                    .and_then(|value| value.as_str())
-                                    .unwrap_or("");
-                                message_content.push(json!({
-                                    "type": "input_image",
-                                    "image_url": format!("data:{media_type};base64,{data}"),
-                                }));
+                                if let Some(data_url) = super::transform::image_source_to_data_url(source) {
+                                    message_content.push(json!({
+                                        "type": "input_image",
+                                        "image_url": data_url,
+                                    }));
+                                }
                             }
                         }
                         "tool_use" => {
@@ -349,16 +343,27 @@ fn convert_messages_to_input(messages: &[Value]) -> anyhow::Result<Vec<Value>> {
                                 message_content.clear();
                             }
 
-                            let output = match block.get("content") {
-                                Some(Value::String(text)) => text.clone(),
-                                Some(other) => serde_json::to_string(other)?,
-                                None => String::new(),
-                            };
+                            let parts = super::transform::normalize_tool_result_content(block.get("content"))?;
+                            let output = super::transform::tool_result_parts_to_text(&parts)
+                                .unwrap_or_else(|| serde_json::to_string(&block.get("content").cloned().unwrap_or(Value::Null)).unwrap_or_default());
+                            let call_id = block.get("tool_use_id").and_then(|value| value.as_str()).unwrap_or("");
                             input.push(json!({
                                 "type": "function_call_output",
-                                "call_id": block.get("tool_use_id").and_then(|value| value.as_str()).unwrap_or(""),
+                                "call_id": call_id,
                                 "output": output,
                             }));
+
+                            if super::transform::tool_result_parts_contain_image(&parts) {
+                                let mut multimodal_content = vec![json!({
+                                    "type": "input_text",
+                                    "text": format!("Tool result for call_id={call_id} follows."),
+                                })];
+                                multimodal_content.extend(super::transform::tool_result_parts_to_responses_content(&parts));
+                                input.push(json!({
+                                    "role": role,
+                                    "content": multimodal_content,
+                                }));
+                            }
                         }
                         "thinking" => {}
                         _ => {}
@@ -377,4 +382,101 @@ fn convert_messages_to_input(messages: &[Value]) -> anyhow::Result<Vec<Value>> {
     }
 
     Ok(input)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_user_image_maps_to_input_image() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "YWJj"
+                    }
+                }]
+            }]
+        });
+
+        let converted = anthropic_to_responses(body, None).unwrap();
+        let input = converted.get("input").and_then(Value::as_array).unwrap();
+        assert_eq!(input[0]["content"][0]["type"], "input_image");
+        assert_eq!(input[0]["content"][0]["image_url"], "data:image/png;base64,YWJj");
+    }
+
+    #[test]
+    fn tool_result_with_text_and_image_adds_multimodal_followup() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Read",
+                        "input": {"file_path": "a.png"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "text", "text": "截图如下"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "YWJj"
+                                }
+                            }
+                        ]
+                    }]
+                }
+            ]
+        });
+
+        let converted = anthropic_to_responses(body, None).unwrap();
+        let input = converted.get("input").and_then(Value::as_array).unwrap();
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "toolu_1");
+        assert!(input[1]["output"].as_str().unwrap().contains("image"));
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(input[2]["content"][0]["type"], "input_text");
+        assert_eq!(input[2]["content"][1]["type"], "input_text");
+        assert_eq!(input[2]["content"][1]["text"], "截图如下");
+        assert_eq!(input[2]["content"][2]["type"], "input_image");
+        assert_eq!(input[2]["content"][2]["image_url"], "data:image/png;base64,YWJj");
+    }
+
+    #[test]
+    fn text_only_tool_result_stays_function_call_output_only() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": "plain text"
+                }]
+            }]
+        });
+
+        let converted = anthropic_to_responses(body, None).unwrap();
+        let input = converted.get("input").and_then(Value::as_array).unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["output"], "plain text");
+    }
 }
