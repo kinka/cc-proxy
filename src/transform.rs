@@ -127,6 +127,12 @@ pub(crate) fn tool_result_parts_to_text(parts: &[ToolResultPart]) -> Option<Stri
     )
 }
 
+pub fn compute_anthropic_input_tokens(prompt_tokens: u32, cache_read_tokens: Option<u32>, cache_creation_tokens: Option<u32>) -> u32 {
+    let cached = cache_read_tokens.unwrap_or(0);
+    let created = cache_creation_tokens.unwrap_or(0);
+    prompt_tokens.saturating_sub(cached.saturating_add(created))
+}
+
 pub(crate) fn tool_result_parts_to_openai_chat_content(parts: &[ToolResultPart]) -> Vec<Value> {
     parts.iter()
         .map(|part| match part {
@@ -348,22 +354,32 @@ pub fn openai_to_anthropic(body: Value) -> anyhow::Result<Value> {
         });
 
     let usage = body.get("usage").cloned().unwrap_or_else(|| json!({}));
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let cache_read = usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(|value| value.as_u64())
+        .or_else(|| usage.get("cache_read_input_tokens").and_then(|value| value.as_u64()));
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|value| value.as_u64());
+
     let mut usage_json = json!({
-        "input_tokens": usage.get("prompt_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
+        "input_tokens": compute_anthropic_input_tokens(
+            prompt_tokens.min(u64::from(u32::MAX)) as u32,
+            cache_read.map(|value| value.min(u64::from(u32::MAX)) as u32),
+            cache_creation.map(|value| value.min(u64::from(u32::MAX)) as u32),
+        ),
         "output_tokens": usage.get("completion_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
     });
 
-    if let Some(cached) = usage
-        .pointer("/prompt_tokens_details/cached_tokens")
-        .and_then(|value| value.as_u64())
-    {
+    if let Some(cached) = cache_read {
         usage_json["cache_read_input_tokens"] = json!(cached);
     }
-    if let Some(cache_read) = usage.get("cache_read_input_tokens") {
-        usage_json["cache_read_input_tokens"] = cache_read.clone();
-    }
-    if let Some(cache_creation) = usage.get("cache_creation_input_tokens") {
-        usage_json["cache_creation_input_tokens"] = cache_creation.clone();
+    if let Some(created) = cache_creation {
+        usage_json["cache_creation_input_tokens"] = json!(created);
     }
 
     Ok(json!({
@@ -654,5 +670,35 @@ mod tests {
         let messages = converted.get("messages").and_then(Value::as_array).unwrap();
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["content"], "plain text");
+    }
+
+    #[test]
+    fn openai_chat_usage_excludes_cache_from_input_tokens() {
+        let body = json!({
+            "id": "chatcmpl_test",
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "ok"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30,
+                "prompt_tokens_details": {
+                    "cached_tokens": 70
+                },
+                "cache_creation_input_tokens": 10
+            }
+        });
+
+        let converted = openai_to_anthropic(body).unwrap();
+        assert_eq!(converted["usage"]["input_tokens"], 40);
+        assert_eq!(converted["usage"]["cache_read_input_tokens"], 70);
+        assert_eq!(converted["usage"]["cache_creation_input_tokens"], 10);
+        assert_eq!(converted["usage"]["output_tokens"], 30);
     }
 }

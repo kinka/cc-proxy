@@ -1,6 +1,6 @@
 use crate::sse::strip_sse_field;
 use crate::transform::{
-    extract_cache_read_tokens, DeltaToolCall, OpenAIStreamChunk,
+    compute_anthropic_input_tokens, extract_cache_read_tokens, DeltaToolCall, OpenAIStreamChunk,
 };
 use crate::{log_request_done, RequestLogContext};
 use bytes::Bytes;
@@ -39,6 +39,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         let mut saw_tool_use = false;
         let mut logged_completion = false;
         let mut sent_message_stop = false;
+        let mut pending_finish_reason: Option<&'static str> = None;
 
         tokio::pin!(stream);
 
@@ -76,6 +77,36 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                     };
 
                     if data.trim() == "[DONE]" {
+                        if !logged_completion {
+                            if let Some(stop_reason) = pending_finish_reason {
+                                let event = json!({
+                                    "type": "message_delta",
+                                    "delta": {
+                                        "stop_reason": stop_reason,
+                                        "stop_sequence": null,
+                                    },
+                                    "usage": pending_usage.clone(),
+                                });
+                                yield Ok(Bytes::from(format!("event: message_delta\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+                            }
+                            log_request_done(
+                                &request_context,
+                                reqwest::StatusCode::OK,
+                                &crate::ResponseLogSummary {
+                                    response_id: message_id.clone(),
+                                    response_model: current_model.clone(),
+                                    stop_reason: pending_finish_reason.map(str::to_string),
+                                    input_tokens: pending_usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    output_tokens: pending_usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    cache_read_input_tokens: pending_usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()),
+                                    cache_creation_input_tokens: pending_usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()),
+                                    has_tool_use: saw_tool_use,
+                                    has_thinking: saw_thinking,
+                                },
+                                true,
+                            );
+                            logged_completion = true;
+                        }
                         if !sent_message_stop {
                             yield Ok(Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
                             sent_message_stop = true;
@@ -96,12 +127,18 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                     }
 
                     if let Some(usage) = &parsed.usage {
-                        pending_usage["input_tokens"] = json!(usage.prompt_tokens);
+                        let cache_read = extract_cache_read_tokens(usage);
+                        let cache_creation = usage.cache_creation_input_tokens;
+                        pending_usage["input_tokens"] = json!(compute_anthropic_input_tokens(
+                            usage.prompt_tokens,
+                            cache_read,
+                            cache_creation,
+                        ));
                         pending_usage["output_tokens"] = json!(usage.completion_tokens);
-                        if let Some(cached) = extract_cache_read_tokens(usage) {
+                        if let Some(cached) = cache_read {
                             pending_usage["cache_read_input_tokens"] = json!(cached);
                         }
-                        if let Some(created) = usage.cache_creation_input_tokens {
+                        if let Some(created) = cache_creation {
                             pending_usage["cache_creation_input_tokens"] = json!(created);
                         }
                     }
@@ -269,47 +306,12 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                             yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
                         }
 
-                        let stop_reason = match finish_reason {
-                            "stop" => Some("end_turn"),
-                            "length" => Some("max_tokens"),
-                            "tool_calls" | "function_call" => Some("tool_use"),
-                            _ => Some("end_turn"),
-                        };
-
-                        let event = json!({
-                            "type": "message_delta",
-                            "delta": {
-                                "stop_reason": stop_reason,
-                                "stop_sequence": null,
-                            },
-                            "usage": pending_usage.clone(),
+                        pending_finish_reason = Some(match finish_reason {
+                            "stop" => "end_turn",
+                            "length" => "max_tokens",
+                            "tool_calls" | "function_call" => "tool_use",
+                            _ => "end_turn",
                         });
-                        yield Ok(Bytes::from(format!("event: message_delta\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
-
-                        if !sent_message_stop {
-                            yield Ok(Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
-                            sent_message_stop = true;
-                        }
-
-                        if !logged_completion {
-                            log_request_done(
-                                &request_context,
-                                reqwest::StatusCode::OK,
-                                &crate::ResponseLogSummary {
-                                    response_id: message_id.clone(),
-                                    response_model: current_model.clone(),
-                                    stop_reason: stop_reason.map(str::to_string),
-                                    input_tokens: pending_usage.get("input_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
-                                    output_tokens: pending_usage.get("output_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
-                                    cache_read_input_tokens: pending_usage.get("cache_read_input_tokens").and_then(|value| value.as_u64()),
-                                    cache_creation_input_tokens: pending_usage.get("cache_creation_input_tokens").and_then(|value| value.as_u64()),
-                                    has_tool_use: saw_tool_use,
-                                    has_thinking: saw_thinking,
-                                },
-                                true,
-                            );
-                            logged_completion = true;
-                        }
                     }
                 }
             }
