@@ -1,6 +1,7 @@
 mod config;
 mod sse;
 mod streaming;
+mod streaming_chat_responses;
 mod streaming_responses;
 mod transform;
 mod transform_responses;
@@ -82,6 +83,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/v1/messages", post(handle_messages))
         .route("/claude/v1/messages", post(handle_messages))
+        .route("/v1/responses", post(handle_responses))
         .with_state(state.clone());
 
     let addr: SocketAddr = format!(
@@ -278,6 +280,142 @@ async fn handle_messages(
     Ok((StatusCode::OK, headers, Json(anthropic_body)).into_response())
 }
 
+async fn handle_responses(
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, Response> {
+    let (parts, body) = request.into_parts();
+    let path = parts.uri.path().to_string();
+    let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let started_at = Instant::now();
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|err| internal_error_with_context(req_id, &path, "read_request_body", None, None, started_at, err))?
+        .to_bytes();
+    let request_body: Value = serde_json::from_slice(&body_bytes)
+        .map_err(bad_request)?;
+    let is_stream = request_body
+        .get("stream")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let requested_model = request_body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let input_count = request_body
+        .get("input")
+        .and_then(|value| value.as_array())
+        .map_or(usize::from(request_body.get("input").is_some()), |input| input.len());
+    let tool_count = request_body
+        .get("tools")
+        .and_then(|value| value.as_array())
+        .map_or(0, |tools| tools.len());
+
+    let mapped_body = apply_model_mapping(request_body, &state.config.upstream.model_map);
+    let mapped_model = mapped_body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let api_format_name = "responses_to_openai_chat";
+    let request_context = RequestLogContext {
+        req_id,
+        path: path.clone(),
+        api_format: api_format_name,
+        started_at,
+    };
+
+    log_request_start(
+        req_id,
+        &path,
+        is_stream,
+        api_format_name,
+        requested_model.as_deref(),
+        mapped_model.as_deref(),
+        input_count,
+        tool_count,
+    );
+
+    let transformed_body = transform_responses::responses_request_to_openai_chat(mapped_body)
+        .map_err(|err| internal_error_with_context(req_id, &path, "transform_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+    let upstream_url = build_upstream_url(&state.config.upstream.base_url, "/chat/completions");
+    let payload = serde_json::to_vec(&transformed_body)
+        .map_err(|err| internal_error_with_context(req_id, &path, "serialize_upstream_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+    let mut upstream_request = state
+        .client
+        .post(&upstream_url)
+        .header("authorization", format!("Bearer {}", state.config.upstream.api_key))
+        .header("content-type", "application/json")
+        .header("accept-encoding", "identity")
+        .body(payload);
+
+    for (name, value) in &state.config.upstream.extra_headers {
+        upstream_request = upstream_request.header(name, value);
+    }
+
+    if let Some(user_agent) = parts
+        .headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+    {
+        upstream_request = upstream_request.header("user-agent", user_agent);
+    }
+
+    let upstream_response = upstream_request
+        .send()
+        .await
+        .map_err(|err| upstream_transport_error_with_context(req_id, &path, api_format_name, is_stream, started_at, err))?;
+    let upstream_status = upstream_response.status();
+
+    if !upstream_status.is_success() {
+        let body = upstream_response.text().await.unwrap_or_default();
+        let message = extract_error_message(&body);
+        log::warn!(
+            "request.upstream_error req_id={} path={} stream={} api_format={} upstream_status={} latency_ms={} error_message={}",
+            req_id,
+            path,
+            is_stream,
+            api_format_name,
+            upstream_status.as_u16(),
+            started_at.elapsed().as_millis(),
+            sanitize_error_message(&message),
+        );
+        return Err(openai_error_response(upstream_status, &message));
+    }
+
+    if is_stream {
+        let stream = upstream_response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|err| std::io::Error::other(err.to_string())));
+        let responses_stream = streaming_chat_responses::create_responses_sse_stream_from_chat(
+            stream,
+            request_context.clone(),
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/event-stream"));
+        headers.insert("cache-control", HeaderValue::from_static("no-cache"));
+        headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        return Ok((headers, Body::from_stream(responses_stream)).into_response());
+    }
+
+    let upstream_body = upstream_response
+        .bytes()
+        .await
+        .map_err(|err| upstream_transport_error_with_context(req_id, &path, api_format_name, is_stream, started_at, err))?;
+    let parsed: Value = serde_json::from_slice(&upstream_body)
+        .map_err(|err| internal_error_with_context(req_id, &path, "parse_upstream_json", Some(api_format_name), Some(is_stream), started_at, err))?;
+    let responses_body = transform_responses::openai_chat_to_responses(parsed)
+        .map_err(|err| internal_error_with_context(req_id, &path, "transform_upstream_response", Some(api_format_name), Some(is_stream), started_at, err))?;
+
+    log_request_done(&request_context, upstream_status, &summarize_responses_response(&responses_body), false);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+    Ok((StatusCode::OK, headers, Json(responses_body)).into_response())
+}
+
+
 fn api_format_name(api_format: ApiFormat) -> &'static str {
     match api_format {
         ApiFormat::OpenAiChat => "openai_chat",
@@ -359,6 +497,25 @@ fn summarize_anthropic_response(body: &Value) -> ResponseLogSummary {
             .and_then(|value| value.as_u64()),
         has_tool_use: content.iter().any(|part| part.get("type").and_then(|value| value.as_str()) == Some("tool_use")),
         has_thinking: content.iter().any(|part| part.get("type").and_then(|value| value.as_str()) == Some("thinking")),
+    }
+}
+
+fn summarize_responses_response(body: &Value) -> ResponseLogSummary {
+    let usage = body.get("usage").unwrap_or(&Value::Null);
+    let output = body.get("output").and_then(|value| value.as_array());
+
+    ResponseLogSummary {
+        response_id: body.get("id").and_then(|value| value.as_str()).map(str::to_string),
+        response_model: body.get("model").and_then(|value| value.as_str()).map(str::to_string),
+        stop_reason: body.get("status").and_then(|value| value.as_str()).map(str::to_string),
+        input_tokens: usage.get("input_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
+        output_tokens: usage.get("output_tokens").and_then(|value| value.as_u64()).unwrap_or(0),
+        cache_read_input_tokens: usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(|value| value.as_u64()),
+        cache_creation_input_tokens: None,
+        has_tool_use: output.is_some_and(|items| items.iter().any(|part| part.get("type").and_then(|value| value.as_str()) == Some("function_call"))),
+        has_thinking: output.is_some_and(|items| items.iter().any(|part| part.get("type").and_then(|value| value.as_str()) == Some("reasoning"))),
     }
 }
 
@@ -555,6 +712,17 @@ fn extract_error_message(body: &str) -> String {
     } else {
         body.trim().to_string()
     }
+}
+
+fn openai_error_response(status: reqwest::StatusCode, message: &str) -> Response {
+    let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let body = json!({
+        "error": {
+            "message": message,
+            "type": "api_error",
+        }
+    });
+    (status, Json(body)).into_response()
 }
 
 fn bad_request(err: impl std::fmt::Display) -> Response {
