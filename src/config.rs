@@ -6,6 +6,8 @@ use std::{collections::HashMap, fs, path::Path};
 pub struct ProxyConfig {
     pub listen: ListenConfig,
     pub upstream: UpstreamConfig,
+    #[serde(default)]
+    pub providers: HashMap<String, UpstreamConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -23,6 +25,8 @@ pub struct UpstreamConfig {
     pub timeout_secs: u64,
     #[serde(default)]
     pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub default_model: Option<String>,
     #[serde(default)]
     pub model_map: HashMap<String, String>,
     #[serde(default)]

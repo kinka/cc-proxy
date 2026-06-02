@@ -6,7 +6,7 @@ mod streaming_responses;
 mod transform;
 mod transform_responses;
 
-use crate::config::{ApiFormat, ProxyConfig};
+use crate::config::{ApiFormat, ProxyConfig, UpstreamConfig};
 use anyhow::{Context, Result};
 use axum::{
     body::Body,
@@ -84,6 +84,9 @@ async fn main() -> Result<()> {
         .route("/v1/messages", post(handle_messages))
         .route("/claude/v1/messages", post(handle_messages))
         .route("/v1/responses", post(handle_responses))
+        .route("/:provider/v1/messages", post(handle_messages_provider))
+        .route("/:provider/claude/v1/messages", post(handle_messages_provider))
+        .route("/:provider/v1/responses", post(handle_responses_provider))
         .with_state(state.clone());
 
     let addr: SocketAddr = format!(
@@ -125,6 +128,22 @@ async fn handle_messages(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, Response> {
+    handle_messages_internal(state, None, request).await
+}
+
+async fn handle_messages_provider(
+    State(state): State<AppState>,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    request: Request,
+) -> Result<Response, Response> {
+    handle_messages_internal(state, Some(provider), request).await
+}
+
+async fn handle_messages_internal(
+    state: AppState,
+    provider_from_path: Option<String>,
+    request: Request,
+) -> Result<Response, Response> {
     let (parts, body) = request.into_parts();
     let path = parts.uri.path().to_string();
     let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -153,12 +172,14 @@ async fn handle_messages(
         .and_then(|value| value.as_array())
         .map_or(0, |tools| tools.len());
 
-    let mapped_body = apply_model_mapping(request_body, &state.config.upstream.model_map);
+    let (upstream, request_body) = resolve_upstream_and_body(request_body, &state.config, provider_from_path.as_deref());
+
+    let mapped_body = apply_model_mapping(request_body, &upstream.model_map, upstream.default_model.as_deref());
     let mapped_model = mapped_body
         .get("model")
         .and_then(|value| value.as_str())
         .map(str::to_string);
-    let api_format = state.config.upstream.api_format;
+    let api_format = upstream.api_format;
     let api_format_name = api_format_name(api_format);
     let request_context = RequestLogContext {
         req_id,
@@ -181,11 +202,11 @@ async fn handle_messages(
     let transformed_body = match api_format {
         ApiFormat::OpenAiChat => transform::anthropic_to_openai(
             mapped_body,
-            state.config.upstream.prompt_cache_key.as_deref(),
+            upstream.prompt_cache_key.as_deref(),
         ),
         ApiFormat::OpenAiResponses => transform_responses::anthropic_to_responses(
             mapped_body,
-            state.config.upstream.prompt_cache_key.as_deref(),
+            upstream.prompt_cache_key.as_deref(),
         ),
     }
     .map_err(|err| internal_error_with_context(req_id, &path, "transform_request", Some(api_format_name), Some(is_stream), started_at, err))?;
@@ -194,19 +215,22 @@ async fn handle_messages(
         ApiFormat::OpenAiChat => "/chat/completions",
         ApiFormat::OpenAiResponses => "/responses",
     };
-    let upstream_url = build_upstream_url(&state.config.upstream.base_url, endpoint);
+    let upstream_url = build_upstream_url(&upstream.base_url, endpoint);
 
     let payload = serde_json::to_vec(&transformed_body)
         .map_err(|err| internal_error_with_context(req_id, &path, "serialize_upstream_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+    let api_key = get_request_api_key(&parts.headers)
+        .unwrap_or_else(|| upstream.api_key.clone());
     let mut upstream_request = state
         .client
         .post(&upstream_url)
-        .header("authorization", format!("Bearer {}", state.config.upstream.api_key))
+        .timeout(Duration::from_secs(upstream.timeout_secs))
+        .header("authorization", format!("Bearer {}", api_key))
         .header("content-type", "application/json")
         .header("accept-encoding", "identity")
         .body(payload);
 
-    for (name, value) in &state.config.upstream.extra_headers {
+    for (name, value) in &upstream.extra_headers {
         upstream_request = upstream_request.header(name, value);
     }
 
@@ -284,6 +308,22 @@ async fn handle_responses(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, Response> {
+    handle_responses_internal(state, None, request).await
+}
+
+async fn handle_responses_provider(
+    State(state): State<AppState>,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+    request: Request,
+) -> Result<Response, Response> {
+    handle_responses_internal(state, Some(provider), request).await
+}
+
+async fn handle_responses_internal(
+    state: AppState,
+    provider_from_path: Option<String>,
+    request: Request,
+) -> Result<Response, Response> {
     let (parts, body) = request.into_parts();
     let path = parts.uri.path().to_string();
     let req_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -312,7 +352,9 @@ async fn handle_responses(
         .and_then(|value| value.as_array())
         .map_or(0, |tools| tools.len());
 
-    let mapped_body = apply_model_mapping(request_body, &state.config.upstream.model_map);
+    let (upstream, request_body) = resolve_upstream_and_body(request_body, &state.config, provider_from_path.as_deref());
+
+    let mapped_body = apply_model_mapping(request_body, &upstream.model_map, upstream.default_model.as_deref());
     let mapped_model = mapped_body
         .get("model")
         .and_then(|value| value.as_str())
@@ -338,18 +380,21 @@ async fn handle_responses(
 
     let transformed_body = transform_responses::responses_request_to_openai_chat(mapped_body)
         .map_err(|err| internal_error_with_context(req_id, &path, "transform_request", Some(api_format_name), Some(is_stream), started_at, err))?;
-    let upstream_url = build_upstream_url(&state.config.upstream.base_url, "/chat/completions");
+    let upstream_url = build_upstream_url(&upstream.base_url, "/chat/completions");
     let payload = serde_json::to_vec(&transformed_body)
         .map_err(|err| internal_error_with_context(req_id, &path, "serialize_upstream_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+    let api_key = get_request_api_key(&parts.headers)
+        .unwrap_or_else(|| upstream.api_key.clone());
     let mut upstream_request = state
         .client
         .post(&upstream_url)
-        .header("authorization", format!("Bearer {}", state.config.upstream.api_key))
+        .timeout(Duration::from_secs(upstream.timeout_secs))
+        .header("authorization", format!("Bearer {}", api_key))
         .header("content-type", "application/json")
         .header("accept-encoding", "identity")
         .body(payload);
 
-    for (name, value) in &state.config.upstream.extra_headers {
+    for (name, value) in &upstream.extra_headers {
         upstream_request = upstream_request.header(name, value);
     }
 
@@ -669,13 +714,19 @@ fn build_upstream_url(base_url: &str, endpoint: &str) -> String {
     url
 }
 
-fn apply_model_mapping(mut body: Value, model_map: &std::collections::HashMap<String, String>) -> Value {
+fn apply_model_mapping(
+    mut body: Value,
+    model_map: &std::collections::HashMap<String, String>,
+    default_model: Option<&str>,
+) -> Value {
     let Some(model) = body.get("model").and_then(|value| value.as_str()) else {
         return body;
     };
 
     if let Some(mapped) = model_map.get(model) {
         body["model"] = json!(mapped);
+    } else if let Some(def) = default_model {
+        body["model"] = json!(def);
     }
 
     body
@@ -767,4 +818,180 @@ fn upstream_transport_error(err: impl std::fmt::Display) -> Response {
         })),
     )
         .into_response()
+}
+
+fn get_request_api_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
+        let trimmed = key.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with("sk-ant-") {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        let trimmed_auth = auth.trim();
+        if !trimmed_auth.is_empty() {
+            if auth.get(..7).map_or(false, |s| s.eq_ignore_ascii_case("Bearer ")) {
+                let token = auth[7..].trim();
+                if !token.is_empty() && !token.starts_with("sk-ant-") {
+                    return Some(token.to_string());
+                }
+            } else if trimmed_auth.get(..7).map_or(false, |s| s.eq_ignore_ascii_case("Bearer ")) {
+                let token = trimmed_auth[7..].trim();
+                if !token.is_empty() && !token.starts_with("sk-ant-") {
+                    return Some(token.to_string());
+                }
+            } else if trimmed_auth.eq_ignore_ascii_case("bearer") {
+                return None;
+            } else if !trimmed_auth.starts_with("sk-ant-") {
+                return Some(trimmed_auth.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_upstream_and_body<'a>(
+    mut body: Value,
+    config: &'a ProxyConfig,
+    provider_from_path: Option<&str>,
+) -> (&'a UpstreamConfig, Value) {
+    if let Some(provider) = provider_from_path {
+        if let Some(upstream_cfg) = config.providers.get(provider) {
+            return (upstream_cfg, body);
+        }
+    }
+
+    let Some(model_str) = body.get("model").and_then(|v| v.as_str()) else {
+        return (&config.upstream, body);
+    };
+
+    if let Some((provider, model_name)) = model_str.split_once('/') {
+        if let Some(upstream_cfg) = config.providers.get(provider) {
+            body["model"] = json!(model_name);
+            return (upstream_cfg, body);
+        }
+    }
+
+    (&config.upstream, body)
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+    use crate::config::{ListenConfig, UpstreamConfig, ApiFormat};
+    use axum::http::HeaderMap;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_get_request_api_key() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(get_request_api_key(&headers), None);
+
+        // 1. Should ignore keys starting with sk-ant-
+        headers.insert("x-api-key", "sk-ant-dummykey12345".parse().unwrap());
+        assert_eq!(get_request_api_key(&headers), None);
+
+        headers.insert("x-api-key", "my-secret-key-1".parse().unwrap());
+        assert_eq!(get_request_api_key(&headers), Some("my-secret-key-1".to_string()));
+
+        headers.remove("x-api-key");
+        
+        // 2. Should ignore Bearer keys starting with sk-ant-
+        headers.insert("authorization", "Bearer sk-ant-dummykey12345".parse().unwrap());
+        assert_eq!(get_request_api_key(&headers), None);
+
+        headers.insert("authorization", "Bearer my-secret-key-2".parse().unwrap());
+        assert_eq!(get_request_api_key(&headers), Some("my-secret-key-2".to_string()));
+
+        headers.insert("authorization", "bearer my-secret-key-3".parse().unwrap());
+        assert_eq!(get_request_api_key(&headers), Some("my-secret-key-3".to_string()));
+
+        headers.insert("authorization", "Bearer   ".parse().unwrap());
+        assert_eq!(get_request_api_key(&headers), None);
+
+        headers.insert("authorization", "Bearer".parse().unwrap());
+        assert_eq!(get_request_api_key(&headers), None);
+
+        headers.insert("authorization", "raw-token".parse().unwrap());
+        assert_eq!(get_request_api_key(&headers), Some("raw-token".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_upstream_and_body() {
+        let default_upstream = UpstreamConfig {
+            base_url: "http://default".to_string(),
+            api_key: "default-key".to_string(),
+            api_format: ApiFormat::OpenAiChat,
+            timeout_secs: 10,
+            prompt_cache_key: None,
+            default_model: None,
+            model_map: HashMap::new(),
+            extra_headers: HashMap::new(),
+        };
+
+        let provider_upstream = UpstreamConfig {
+            base_url: "http://provider".to_string(),
+            api_key: "provider-key".to_string(),
+            api_format: ApiFormat::OpenAiResponses,
+            timeout_secs: 20,
+            prompt_cache_key: None,
+            default_model: None,
+            model_map: HashMap::new(),
+            extra_headers: HashMap::new(),
+        };
+
+        let mut providers = HashMap::new();
+        providers.insert("my-provider".to_string(), provider_upstream.clone());
+
+        let config = ProxyConfig {
+            listen: ListenConfig { host: "127.0.0.1".to_string(), port: 8080 },
+            upstream: default_upstream.clone(),
+            providers,
+        };
+
+        // 1. No provider prefix
+        let body1 = json!({ "model": "claude-3-sonnet" });
+        let (up1, body1_res) = resolve_upstream_and_body(body1, &config, None);
+        assert_eq!(up1.base_url, "http://default");
+        assert_eq!(body1_res["model"], "claude-3-sonnet");
+
+        // 2. With provider prefix
+        let body2 = json!({ "model": "my-provider/claude-3-sonnet" });
+        let (up2, body2_res) = resolve_upstream_and_body(body2, &config, None);
+        assert_eq!(up2.base_url, "http://provider");
+        assert_eq!(body2_res["model"], "claude-3-sonnet");
+
+        // 3. With non-existent provider prefix
+        let body3 = json!({ "model": "other-provider/claude-3-sonnet" });
+        let (up3, body3_res) = resolve_upstream_and_body(body3, &config, None);
+        assert_eq!(up3.base_url, "http://default");
+        assert_eq!(body3_res["model"], "other-provider/claude-3-sonnet");
+
+        // 4. With provider from path
+        let body4 = json!({ "model": "claude-3-sonnet" });
+        let (up4, body4_res) = resolve_upstream_and_body(body4, &config, Some("my-provider"));
+        assert_eq!(up4.base_url, "http://provider");
+        assert_eq!(body4_res["model"], "claude-3-sonnet");
+    }
+
+    #[test]
+    fn test_apply_model_mapping() {
+        let mut model_map = HashMap::new();
+        model_map.insert("claude-4".to_string(), "mimo-v4.0".to_string());
+
+        // 1. Matched in map
+        let body1 = json!({ "model": "claude-4" });
+        let res1 = apply_model_mapping(body1, &model_map, Some("fallback-model"));
+        assert_eq!(res1["model"], "mimo-v4.0");
+
+        // 2. Fallback to default_model when not matched in map
+        let body2 = json!({ "model": "other-model" });
+        let res2 = apply_model_mapping(body2, &model_map, Some("fallback-model"));
+        assert_eq!(res2["model"], "fallback-model");
+
+        // 3. Keep original when no match and no default_model
+        let body3 = json!({ "model": "other-model" });
+        let res3 = apply_model_mapping(body3, &model_map, None);
+        assert_eq!(res3["model"], "other-model");
+    }
 }

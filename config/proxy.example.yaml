@@ -12,3 +12,17 @@ upstream:
     claude-sonnet-4-20250514: "gpt-5"
     claude-opus-4-20250514: "gpt-5"
   extra_headers: {}
+
+# Optional: Configure multiple different backend connections (providers).
+# When a client requests a model via "provider_name/model_name", the proxy will strip 
+# "provider_name/" and use that provider's configuration instead of the default upstream.
+# For example, using model "mimo/claude-3-5-sonnet" will route to the mimo upstream.
+providers:
+  mimo:
+    base_url: "https://token-plan-cn.xiaomimimo.com/v1"
+    api_key: "your-mimo-api-key"
+    api_format: "openai_chat"
+    timeout_secs: 600
+    default_model: "mimo-v2.5-pro"
+    extra_headers: {}
+
