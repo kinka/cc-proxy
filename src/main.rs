@@ -174,7 +174,12 @@ async fn handle_messages_internal(
 
     let (upstream, request_body) = resolve_upstream_and_body(request_body, &state.config, provider_from_path.as_deref());
 
-    let mapped_body = apply_model_mapping(request_body, &upstream.model_map, upstream.default_model.as_deref());
+    let mut mapped_body = apply_model_mapping(request_body, &upstream.model_map, upstream.default_model.as_deref());
+    if let Some(ref vision_model) = upstream.vision_model {
+        if transform::request_has_image(&mapped_body) {
+            mapped_body["model"] = json!(vision_model);
+        }
+    }
     let mapped_model = mapped_body
         .get("model")
         .and_then(|value| value.as_str())
@@ -203,6 +208,7 @@ async fn handle_messages_internal(
         ApiFormat::OpenAiChat => transform::anthropic_to_openai(
             mapped_body,
             upstream.prompt_cache_key.as_deref(),
+            upstream.strip_tool_result_images,
         ),
         ApiFormat::OpenAiResponses => transform_responses::anthropic_to_responses(
             mapped_body,
@@ -926,6 +932,8 @@ mod main_tests {
             prompt_cache_key: None,
             default_model: None,
             model_map: HashMap::new(),
+            vision_model: None,
+            strip_tool_result_images: false,
             extra_headers: HashMap::new(),
         };
 
@@ -937,6 +945,8 @@ mod main_tests {
             prompt_cache_key: None,
             default_model: None,
             model_map: HashMap::new(),
+            vision_model: None,
+            strip_tool_result_images: false,
             extra_headers: HashMap::new(),
         };
 

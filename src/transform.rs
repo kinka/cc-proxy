@@ -157,7 +157,30 @@ pub(crate) fn tool_result_parts_to_responses_content(parts: &[ToolResultPart]) -
         .collect()
 }
 
-pub fn anthropic_to_openai(body: Value, cache_key: Option<&str>) -> anyhow::Result<Value> {
+pub fn request_has_image(body: &Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    messages.iter().any(|msg| {
+        let Some(content) = msg.get("content").and_then(|v| v.as_array()) else {
+            return false;
+        };
+        content.iter().any(|block| {
+            match block.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "image" => true,
+                "tool_result" => block
+                    .get("content")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|parts| {
+                        parts.iter().any(|p| p.get("type").and_then(|v| v.as_str()) == Some("image"))
+                    }),
+                _ => false,
+            }
+        })
+    })
+}
+
+pub fn anthropic_to_openai(body: Value, cache_key: Option<&str>, strip_tool_result_images: bool) -> anyhow::Result<Value> {
     let mut result = json!({});
 
     if let Some(model) = body.get("model").and_then(|value| value.as_str()) {
@@ -188,8 +211,11 @@ pub fn anthropic_to_openai(body: Value, cache_key: Option<&str>) -> anyhow::Resu
                 .get("role")
                 .and_then(|value| value.as_str())
                 .unwrap_or("user");
-            let converted = convert_message_to_openai(role, message.get("content"))?;
+            let (converted, extracted_images) = convert_message_to_openai(role, message.get("content"), strip_tool_result_images)?;
             messages.extend(converted);
+            if !extracted_images.is_empty() {
+                messages.push(json!({ "role": "user", "content": extracted_images }));
+            }
         }
     }
 
@@ -394,16 +420,18 @@ pub fn openai_to_anthropic(body: Value) -> anyhow::Result<Value> {
     }))
 }
 
-fn convert_message_to_openai(role: &str, content: Option<&Value>) -> anyhow::Result<Vec<Value>> {
+fn convert_message_to_openai(role: &str, content: Option<&Value>, strip_tool_result_images: bool) -> anyhow::Result<(Vec<Value>, Vec<Value>)> {
     let mut result = Vec::new();
+    let mut extracted_images: Vec<Value> = Vec::new();
+
     let Some(content) = content else {
         result.push(json!({ "role": role, "content": null }));
-        return Ok(result);
+        return Ok((result, extracted_images));
     };
 
     if let Some(text) = content.as_str() {
         result.push(json!({ "role": role, "content": text }));
-        return Ok(result);
+        return Ok((result, extracted_images));
     }
 
     if let Some(blocks) = content.as_array() {
@@ -446,7 +474,23 @@ fn convert_message_to_openai(role: &str, content: Option<&Value>) -> anyhow::Res
                 }
                 "tool_result" => {
                     let parts = normalize_tool_result_content(block.get("content"))?;
-                    let content = if let Some(text) = tool_result_parts_to_text(&parts) {
+                    let tool_content = if strip_tool_result_images && tool_result_parts_contain_image(&parts) {
+                        let text_parts: Vec<_> = parts.iter()
+                            .filter(|p| matches!(p, ToolResultPart::Text(_)))
+                            .cloned()
+                            .collect();
+                        let images = parts.iter()
+                            .filter(|p| matches!(p, ToolResultPart::Image { .. }))
+                            .map(|p| match p {
+                                ToolResultPart::Image { data_url } => json!({
+                                    "type": "image_url",
+                                    "image_url": { "url": data_url },
+                                }),
+                                _ => unreachable!(),
+                            });
+                        extracted_images.extend(images);
+                        json!(tool_result_parts_to_text(&text_parts).unwrap_or_default())
+                    } else if let Some(text) = tool_result_parts_to_text(&parts) {
                         json!(text)
                     } else {
                         json!(tool_result_parts_to_openai_chat_content(&parts))
@@ -454,7 +498,7 @@ fn convert_message_to_openai(role: &str, content: Option<&Value>) -> anyhow::Res
                     result.push(json!({
                         "role": "tool",
                         "tool_call_id": block.get("tool_use_id").and_then(|value| value.as_str()).unwrap_or(""),
-                        "content": content,
+                        "content": tool_content,
                     }));
                 }
                 "thinking" => {}
@@ -483,11 +527,11 @@ fn convert_message_to_openai(role: &str, content: Option<&Value>) -> anyhow::Res
             result.push(message);
         }
 
-        return Ok(result);
+        return Ok((result, extracted_images));
     }
 
     result.push(json!({ "role": role, "content": content }));
-    Ok(result)
+    Ok((result, extracted_images))
 }
 
 pub fn clean_schema(mut schema: Value) -> Value {
@@ -585,6 +629,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_has_image_detects_user_image() {
+        let body = json!({"messages": [{"role": "user", "content": [{"type": "image", "source": {}}]}]});
+        assert!(request_has_image(&body));
+    }
+
+    #[test]
+    fn request_has_image_detects_tool_result_image() {
+        let body = json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "text", "text": "ok"},
+                {"type": "image", "source": {}}
+            ]}
+        ]}]});
+        assert!(request_has_image(&body));
+    }
+
+    #[test]
+    fn request_has_image_false_for_text_only() {
+        let body = json!({"messages": [{"role": "user", "content": "hello"}]});
+        assert!(!request_has_image(&body));
+    }
+
+    #[test]
+    fn vision_model_overrides_when_image_present() {
+        let body = json!({
+            "model": "mimo-v2.5-pro",
+            "messages": [{"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "YWJj"}}]}]
+        });
+        let converted = anthropic_to_openai(body, None, false).unwrap();
+        // 验证 image 被正常转换（vision_model 覆盖在 main.rs 层，transform 层不管）
+        let messages = converted["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["content"][0]["type"], "image_url");
+    }
+
+    #[test]
     fn standard_user_image_maps_to_image_url() {
         let body = json!({
             "model": "test-model",
@@ -601,7 +680,7 @@ mod tests {
             }]
         });
 
-        let converted = anthropic_to_openai(body, None).unwrap();
+        let converted = anthropic_to_openai(body, None, false).unwrap();
         let messages = converted.get("messages").and_then(Value::as_array).unwrap();
         assert_eq!(messages[0]["content"][0]["type"], "image_url");
         assert_eq!(messages[0]["content"][0]["image_url"]["url"], "data:image/png;base64,YWJj");
@@ -642,7 +721,7 @@ mod tests {
             ]
         });
 
-        let converted = anthropic_to_openai(body, None).unwrap();
+        let converted = anthropic_to_openai(body, None, false).unwrap();
         let messages = converted.get("messages").and_then(Value::as_array).unwrap();
         let tool_message = messages.iter().find(|message| message["role"] == "tool").unwrap();
         let content = tool_message.get("content").and_then(Value::as_array).unwrap();
@@ -666,10 +745,47 @@ mod tests {
             }]
         });
 
-        let converted = anthropic_to_openai(body, None).unwrap();
+        let converted = anthropic_to_openai(body, None, false).unwrap();
         let messages = converted.get("messages").and_then(Value::as_array).unwrap();
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["content"], "plain text");
+    }
+
+    #[test]
+    fn strip_tool_result_images_extracts_image_to_follow_up_user_message() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "screenshot", "input": {}}]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": [
+                            {"type": "text", "text": "ok"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "YWJj"}}
+                        ]
+                    }]
+                }
+            ]
+        });
+
+        let converted = anthropic_to_openai(body, None, true).unwrap();
+        let messages = converted.get("messages").and_then(Value::as_array).unwrap();
+
+        // tool message should have text only
+        let tool_msg = messages.iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(tool_msg["content"], "ok");
+
+        // follow-up user message should carry the image
+        let follow_up = messages.iter().find(|m| m["role"] == "user").unwrap();
+        let content = follow_up.get("content").and_then(Value::as_array).unwrap();
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,YWJj");
     }
 
     #[test]

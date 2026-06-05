@@ -30,6 +30,10 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub model_map: HashMap<String, String>,
     #[serde(default)]
+    pub vision_model: Option<String>,
+    #[serde(default)]
+    pub strip_tool_result_images: bool,
+    #[serde(default)]
     pub extra_headers: HashMap<String, String>,
 }
 
