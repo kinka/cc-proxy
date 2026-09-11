@@ -155,6 +155,30 @@ are required and have no default — the obvious default would be the script's o
 tag, which then silently grows a binary layer on every run. Point them at a published tag
 or at whatever `scripts/build.sh` last left locally.
 
+#### Keep the base fixed across releases
+
+Each run adds exactly **one** layer on top of its base (measured: 4 layers / 119MB → 5
+layers / 126MB, the delta being the 6.4MB binary). So the layer count only grows if
+releases are *chained*:
+
+| `BASE_*` points at | v0.2.0 | v0.3.0 | v0.4.0 |
+| --- | --- | --- | --- |
+| a fixed `latest-<arch>` | 5 layers | 5 layers | 5 layers |
+| the previous release | 5 layers | 6 layers | 7 layers |
+
+Chaining never removes the older binaries — they stay in the lower layers, shadowed, and
+everyone pulling the image keeps downloading them.
+
+Two rules keep this flat:
+
+- **Always pass an explicit `VERSION`.** It defaults to `latest`, so a bare `--push` writes
+  `<image>:latest-<arch>` — the very tag `BASE_*` usually points at — and quietly turns the
+  next release into a chained one. The script refuses this exact case, but only by string
+  comparison, so don't rely on it alone.
+- **Let `scripts/build.sh` own the base tag.** Re-cut it from there periodically (it is also
+  the only way the OS packages ever move); `build-zigbuild.sh` should only ever publish
+  version tags.
+
 The tradeoff is that the base image's OS packages are *not* refreshed — the reused layer is
 only debian-slim + `ca-certificates`. Use `scripts/build.sh` when that layer needs to move;
 use this one for iterating on the Rust code.

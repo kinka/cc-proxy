@@ -33,6 +33,11 @@ PUSH=false
 # no default: the obvious one would be this script's own output tag, which then grows a
 # fresh binary layer on every run without ever saying so. Point these at a published tag
 # (`.../cc-proxy:latest-arm64`) or at whatever `scripts/build.sh` last left locally.
+#
+# Keep these pinned to a *fixed* runtime tag across releases. Every run adds exactly one
+# layer on top of its base, so basing v0.3.0 on the fixed tag keeps the layer count flat,
+# while basing it on v0.2.0 chains them: +1 layer and +~6MB per release, with every older
+# binary still in the image, shadowed but not removed.
 BASE_ARM64="${BASE_ARM64:-}"
 BASE_AMD64="${BASE_AMD64:-}"
 
@@ -68,6 +73,23 @@ build a runtime layer. Both must already exist locally or be pullable, e.g.
     BASE_AMD64=<registry>/cc-proxy:latest-amd64 ./scripts/build-zigbuild.sh
 MSG
     exit 1
+fi
+
+# `VERSION` defaults to `latest`, so a bare `--push` writes `<image>:latest-<arch>` — which is
+# exactly the tag people point BASE at. That overwrites the base with this run's output, and
+# the *next* release then silently chains onto it instead of onto a fixed runtime layer.
+# String comparison only, so it won't catch two spellings of the same tag; it catches the one
+# way this actually goes wrong.
+if [ "$PUSH" = true ]; then
+    for pair in "arm64:$BASE_ARM64" "amd64:$BASE_AMD64"; do
+        arch="${pair%%:*}"
+        base="${pair#*:}"
+        if [ "$FULL_IMAGE:$VERSION-$arch" = "$base" ]; then
+            echo "refusing to push $FULL_IMAGE:$VERSION-$arch over its own base." >&2
+            echo "Pass an explicit VERSION (e.g. VERSION=v0.3.0), and let scripts/build.sh own the base tag." >&2
+            exit 1
+        fi
+    done
 fi
 
 STAGE_DIR="$(mktemp -d)"
