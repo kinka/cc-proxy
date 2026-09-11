@@ -194,3 +194,14 @@ export ANTHROPIC_AUTH_TOKEN=PROXY_MANAGED
 - Some OpenAI-compatible gateways return slightly different SSE or response shapes. This project already handles several common variants, but provider-specific adjustments may still be needed.
 - Debug logging can be enabled with `RUST_LOG=debug`.
 - Do not commit local config files containing real credentials.
+- **Reasoning must round-trip.** Anthropic clients send prior reasoning back as `thinking`
+  blocks on the assistant turn, and the request conversion restores them as
+  `reasoning_content`. This is not optional bookkeeping: DeepSeek rejects the entire request
+  with `The 'reasoning_content' in the thinking mode must be passed back to the API` as soon
+  as an assistant turn carries `tool_calls` without it, so dropping the block breaks every
+  multi-turn tool-using session on those models. The failure is all-or-nothing and behaves
+  identically under `stream: true` and `stream: false`. When the client sends no thinking
+  block at all but the turn does carry `tool_calls`, the field is emitted as an empty string
+  — clients legitimately lose reasoning (pi downgrades a signature-less thinking block to
+  plain text after an aborted stream), and an empty value satisfies the check instead of
+  failing the request.

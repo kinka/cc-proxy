@@ -437,6 +437,12 @@ fn convert_message_to_openai(role: &str, content: Option<&Value>, strip_tool_res
     if let Some(blocks) = content.as_array() {
         let mut content_parts = Vec::new();
         let mut tool_calls = Vec::new();
+        // Anthropic carries prior reasoning as `thinking` blocks on the assistant turn;
+        // the OpenAI-shaped upstream wants it back as `reasoning_content`. Dropping it
+        // is not merely lossy: DeepSeek rejects the whole request with
+        // "The `reasoning_content` in the thinking mode must be passed back to the API"
+        // as soon as the assistant turn carries tool_calls. See the assembly below.
+        let mut reasoning_text = String::new();
 
         for block in blocks {
             match block.get("type").and_then(|value| value.as_str()).unwrap_or("") {
@@ -501,7 +507,11 @@ fn convert_message_to_openai(role: &str, content: Option<&Value>, strip_tool_res
                         "content": tool_content,
                     }));
                 }
-                "thinking" => {}
+                "thinking" => {
+                    if let Some(text) = block.get("thinking").and_then(|value| value.as_str()) {
+                        reasoning_text.push_str(text);
+                    }
+                }
                 _ => {}
             }
         }
@@ -522,6 +532,24 @@ fn convert_message_to_openai(role: &str, content: Option<&Value>, strip_tool_res
 
             if !tool_calls.is_empty() {
                 message["tool_calls"] = json!(tool_calls);
+            }
+
+            // Only the assistant turn can carry reasoning, and only that turn is what the
+            // upstream checks. Sending it on a user turn would be meaningless at best.
+            //
+            // The empty-string fallback is the part that is easy to delete by mistake: a
+            // client that dropped its own reasoning still has to send *something*, because
+            // the upstream check fires on "assistant turn has tool_calls and no
+            // reasoning_content" and rejects the whole request. pi does exactly this when a
+            // thinking block lost its signature (aborted stream) — it downgrades the block
+            // to plain text, so nothing reaches us to restore. Verified accepted by
+            // qwen3.7-plus / glm-5.1 / deepseek-v4-flash.
+            if role == "assistant" {
+                if !reasoning_text.is_empty() {
+                    message["reasoning_content"] = json!(reasoning_text);
+                } else if !tool_calls.is_empty() {
+                    message["reasoning_content"] = json!("");
+                }
             }
 
             result.push(message);
@@ -786,6 +814,103 @@ mod tests {
         let content = follow_up.get("content").and_then(Value::as_array).unwrap();
         assert_eq!(content[0]["type"], "image_url");
         assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,YWJj");
+    }
+
+    /// DeepSeek (every `model_type: messages` model on the internal gateway) rejects the
+    /// whole request with "The `reasoning_content` in the thinking mode must be passed back
+    /// to the API" when an assistant turn carries tool_calls but no reasoning. Anthropic
+    /// clients send that reasoning as a `thinking` block, so dropping the block turns every
+    /// second round of any tool-using DeepSeek session into a hard failure — which is
+    /// exactly what sub-agents do, since the haiku/sonnet/opus aliases all map to it.
+    #[test]
+    fn assistant_thinking_block_returns_as_reasoning_content() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [
+                { "role": "user", "content": "今天工时" },
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "需要调用工时查询工具。", "signature": "sig_1" },
+                        { "type": "tool_use", "id": "toolu_1", "name": "query_worklog", "input": { "date": "2026-09-10" } }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{ "type": "tool_result", "tool_use_id": "toolu_1", "content": "8.5h" }]
+                }
+            ]
+        });
+
+        let converted = anthropic_to_openai(body, None, false).unwrap();
+        let messages = converted.get("messages").and_then(Value::as_array).unwrap();
+        let assistant = messages
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("assistant turn survives conversion");
+
+        assert_eq!(assistant["reasoning_content"], "需要调用工时查询工具。");
+        // The thinking block must not also leak into visible content.
+        assert!(assistant.get("tool_calls").is_some());
+        assert_eq!(assistant["content"], Value::Null);
+    }
+
+    /// Reasoning only belongs on the assistant turn; a user turn never has any, and
+    /// attaching one would be meaningless to the upstream.
+    #[test]
+    fn user_turn_never_gets_reasoning_content() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "thinking", "thinking": "不该出现在这里", "signature": "sig_2" },
+                    { "type": "text", "text": "你好" }
+                ]
+            }]
+        });
+
+        let converted = anthropic_to_openai(body, None, false).unwrap();
+        let messages = converted.get("messages").and_then(Value::as_array).unwrap();
+        assert!(messages[0].get("reasoning_content").is_none());
+    }
+
+    /// A client that lost its own reasoning (pi downgrades a signature-less thinking block
+    /// to plain text) must still produce the field, or the upstream rejects the request.
+    #[test]
+    fn assistant_tool_calls_without_thinking_get_empty_reasoning_content() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "让我查一下" },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "query_worklog",
+                        "input": { "date": "2026-09-10" }
+                    }
+                ]
+            }]
+        });
+
+        let converted = anthropic_to_openai(body, None, false).unwrap();
+        let messages = converted.get("messages").and_then(Value::as_array).unwrap();
+        assert_eq!(messages[0].get("reasoning_content"), Some(&json!("")));
+    }
+
+    /// Without tool_calls the upstream never checks, so do not invent the field.
+    #[test]
+    fn assistant_plain_text_gets_no_reasoning_content() {
+        let body = json!({
+            "model": "test-model",
+            "messages": [{ "role": "assistant", "content": "好的" }]
+        });
+
+        let converted = anthropic_to_openai(body, None, false).unwrap();
+        let messages = converted.get("messages").and_then(Value::as_array).unwrap();
+        assert!(messages[0].get("reasoning_content").is_none());
     }
 
     #[test]
