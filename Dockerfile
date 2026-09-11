@@ -9,6 +9,10 @@ ENV CARGO_HTTP_TIMEOUT=${CARGO_HTTP_TIMEOUT} \
 
 WORKDIR /app
 COPY Cargo.toml ./Cargo.toml
+# Without the lockfile this image resolves dependencies fresh, so it can drift away from
+# what `scripts/build-zigbuild.sh` (which does honour the lockfile) produced from the same
+# commit — two build paths, two dependency sets, same tag.
+COPY Cargo.lock ./Cargo.lock
 COPY .cargo ./.cargo
 COPY src ./src
 

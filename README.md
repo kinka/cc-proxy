@@ -130,6 +130,45 @@ The build script defaults to `sparse+https://rsproxy.cn/index/` for Cargo. Overr
 CARGO_REGISTRY_INDEX="sparse+https://your-mirror.example.com/index/" ./scripts/build.sh
 ```
 
+### Without pulling the Rust toolchain image
+
+`scripts/build.sh` compiles inside `rust:1.94-bookworm` (~1.5GB), once per platform. Behind a
+slow registry mirror that pull alone can take hours and is by far the longest part of the
+build. `scripts/build-zigbuild.sh` avoids it: cross-compile on the host, then layer the
+binary onto an already-present runtime image.
+
+```bash
+brew install zig
+cargo install cargo-zigbuild
+rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+BASE_ARM64=cc-proxy:arm64 BASE_AMD64=cc-proxy:amd64 ./scripts/build-zigbuild.sh
+
+VERSION=v0.3.0 REGISTRY=registry.example.com/ns \
+  BASE_ARM64=registry.example.com/ns/cc-proxy:latest-arm64 \
+  BASE_AMD64=registry.example.com/ns/cc-proxy:latest-amd64 \
+  ./scripts/build-zigbuild.sh --push
+```
+
+Same output tags and manifest scheme as `scripts/build.sh`. `BASE_ARM64` / `BASE_AMD64`
+are required and have no default — the obvious default would be the script's own output
+tag, which then silently grows a binary layer on every run. Point them at a published tag
+or at whatever `scripts/build.sh` last left locally.
+
+The tradeoff is that the base image's OS packages are *not* refreshed — the reused layer is
+only debian-slim + `ca-certificates`. Use `scripts/build.sh` when that layer needs to move;
+use this one for iterating on the Rust code.
+
+Two things this depends on, both of which are easy to break:
+
+- **`reqwest` must stay on `default-features = false`.** The default `default-tls` feature
+  pulls in `openssl-sys`, which needs a C toolchain and cross-compiled headers, and that
+  kills the musl targets outright.
+- **The TLS feature must be `rustls-tls-native-roots`, not `rustls-tls`.** Plain
+  `rustls-tls` bundles webpki roots and ignores `/etc/ssl/certs`, so an internal MITM CA
+  stops being trusted. The symptom is TLS failures that only show up inside the corporate
+  network.
+
 ## Quick Run
 
 Use the bundled runner:
