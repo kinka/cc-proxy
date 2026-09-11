@@ -301,6 +301,75 @@ pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'stat
                 }
             }
         }
+
+        // Upstream closed without `[DONE]`, so the branch that writes `response.completed`
+        // never ran. Left alone that is a `200` stream with no terminator and no log line —
+        // the caller blocks or reads it as empty, and the only trace is an unpaired
+        // `request.start`. Close the response out, but mark it `incomplete` so nobody
+        // downstream mistakes a cut-off answer for a finished one.
+        if !logged_completion {
+            for event in finish_text_item(
+                &mut text_started,
+                &mut text_item_id,
+                &mut text_buffer,
+                &mut output_index,
+                &mut completed_output,
+                &mut completed_output_text,
+            ) {
+                yield Ok(event);
+            }
+
+            for event in finish_pending_tool_calls(
+                &tool_calls_by_index,
+                &mut completed_tool_call_ids,
+                &mut completed_output,
+            ) {
+                yield Ok(event);
+            }
+
+            if response_id.is_some() {
+                let response = json!({
+                    "id": response_id.clone().unwrap_or_default(),
+                    "object": "response",
+                    "status": "incomplete",
+                    "incomplete_details": { "reason": "upstream_closed" },
+                    "model": current_model.clone().unwrap_or_default(),
+                    "output": std::mem::take(&mut completed_output),
+                    "output_text": completed_output_text.clone(),
+                    "usage": pending_usage.clone(),
+                });
+                let incomplete = json!({
+                    "type": "response.incomplete",
+                    "response": response,
+                });
+                yield Ok(Bytes::from(format!("event: response.incomplete\ndata: {}\n\n", serde_json::to_string(&incomplete).unwrap_or_default())));
+            } else {
+                // No `response.created` ever went out, so there is no response to complete.
+                let event = json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "upstream closed the stream before sending any content",
+                    }
+                });
+                yield Ok(Bytes::from(format!("event: error\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+            }
+            yield Ok(Bytes::from("data: [DONE]\n\n"));
+
+            log::error!(
+                "request.error req_id={} path={} stage=stream_truncated api_format={} stream=true latency_ms={} response_id={} response_model={} finish_reason={} has_tool_use={} text_chars={} trailing_bytes={} error=upstream stream ended without [DONE]",
+                request_context.req_id,
+                request_context.path,
+                request_context.api_format,
+                request_context.started_at.elapsed().as_millis(),
+                response_id.as_deref().unwrap_or(""),
+                current_model.as_deref().unwrap_or(""),
+                pending_finish_reason.as_deref().unwrap_or(""),
+                !tool_calls_by_index.is_empty(),
+                completed_output_text.chars().count(),
+                buffer.len(),
+            );
+        }
     }
 }
 
@@ -461,6 +530,69 @@ mod tests {
         let completed = sse_event_json(&body, "response.completed");
         assert_eq!(completed["response"]["output"][0]["content"][0]["text"], "hello");
         assert_eq!(completed["response"]["output_text"], "hello");
+    }
+
+    async fn collect(chunks: Vec<&'static str>) -> String {
+        let stream = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
+        );
+        let context = RequestLogContext {
+            req_id: 1,
+            path: "/v1/responses".to_string(),
+            api_format: "responses_to_openai_chat",
+            started_at: Instant::now(),
+        };
+        create_responses_sse_stream_from_chat(stream, context)
+            .try_fold(String::new(), |mut body, bytes| async move {
+                body.push_str(&String::from_utf8(bytes.to_vec()).unwrap());
+                Ok(body)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// An upstream that closes mid-turn must still terminate the response, and must say the
+    /// answer was cut off rather than pass a partial one off as finished.
+    #[tokio::test]
+    async fn upstream_stream_without_done_terminates_as_incomplete() {
+        let body = collect(vec![
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n",
+        ])
+        .await;
+
+        assert!(!body.contains("event: response.completed"));
+        let incomplete = sse_event_json(&body, "response.incomplete");
+        assert_eq!(incomplete["response"]["status"], "incomplete");
+        assert_eq!(incomplete["response"]["incomplete_details"]["reason"], "upstream_closed");
+        assert_eq!(incomplete["response"]["output_text"], "he");
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    /// Nothing was ever emitted, so there is no response to complete: fail loudly.
+    #[tokio::test]
+    async fn upstream_stream_with_no_content_at_all_emits_an_error_event() {
+        let body = collect(vec![": keep-alive\n\n"]).await;
+
+        assert!(body.contains("event: error"));
+        assert!(!body.contains("event: response.incomplete"));
+        assert!(body.ends_with("data: [DONE]\n\n"));
+    }
+
+    /// The normal path must not gain a second terminator from the truncation handling.
+    #[tokio::test]
+    async fn normal_done_sentinel_terminates_exactly_once() {
+        let body = collect(vec![
+            "data: {\"id\":\"chatcmpl_1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert_eq!(body.matches("event: response.completed").count(), 1);
+        assert_eq!(body.matches("data: [DONE]").count(), 1);
+        assert!(!body.contains("event: response.incomplete"));
+        assert!(!body.contains("event: error"));
     }
 
     fn sse_event_json(body: &str, event_name: &str) -> Value {

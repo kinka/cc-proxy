@@ -345,6 +345,58 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                 }
             }
         }
+
+        // Same hole as the Chat adapter: the terminator only ever gets written inside
+        // `response.completed`. An upstream that EOFs mid-turn — or reports `response.failed`,
+        // which falls through the match above — leaves a `200` stream with no `message_stop`
+        // and no log line at all, just an unpaired `request.start`.
+        if !logged_completion {
+            if has_sent_message_start {
+                for index in open_indices.drain() {
+                    let event = json!({ "type": "content_block_stop", "index": index });
+                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+                }
+                let event = json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": if has_tool_use { "tool_use" } else { "end_turn" },
+                        "stop_sequence": null,
+                    },
+                    "usage": build_anthropic_usage_from_responses(None),
+                });
+                yield Ok(Bytes::from(format!("event: message_delta\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+                if !sent_message_stop {
+                    yield Ok(Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+                }
+            } else {
+                // Nothing was ever emitted, so there is no message to stop. Fail loudly instead
+                // of handing back an empty `200`.
+                let event = json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "upstream closed the stream before sending any content",
+                    }
+                });
+                yield Ok(Bytes::from(format!("event: error\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+            }
+
+            log::error!(
+                "request.error req_id={} path={} stage=stream_truncated api_format={} stream=true latency_ms={} response_id={} response_model={} sent_message_start={} has_tool_use={} has_thinking={} thinking_chars={} text_chars={} trailing_bytes={} error=upstream stream ended without response.completed",
+                request_context.req_id,
+                request_context.path,
+                request_context.api_format,
+                request_context.started_at.elapsed().as_millis(),
+                message_id.as_deref().unwrap_or(""),
+                current_model.as_deref().unwrap_or(""),
+                has_sent_message_start,
+                has_tool_use,
+                saw_thinking,
+                thinking_chars,
+                text_chars,
+                buffer.len(),
+            );
+        }
     }
 }
 
@@ -412,4 +464,85 @@ fn tool_item_key_from_event(data: &Value) -> Option<String> {
     data.get("output_index")
         .and_then(|value| value.as_u64())
         .map(|index| format!("tool:out:{index}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::TryStreamExt;
+    use std::time::Instant;
+
+    async fn collect(chunks: Vec<&'static str>) -> String {
+        let stream = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
+        );
+        let context = RequestLogContext {
+            req_id: 1,
+            path: "/v1/messages".to_string(),
+            api_format: "openai_responses",
+            started_at: Instant::now(),
+        };
+        create_anthropic_sse_stream_from_responses(stream, context)
+            .try_fold(String::new(), |mut body, bytes| async move {
+                body.push_str(&String::from_utf8(bytes.to_vec()).unwrap());
+                Ok(body)
+            })
+            .await
+            .unwrap()
+    }
+
+    /// An upstream that closes before `response.completed` must still produce a terminated
+    /// Anthropic message; otherwise the client reads the stream as an empty reply.
+    #[tokio::test]
+    async fn upstream_stream_without_completed_still_terminates_the_message() {
+        let body = collect(vec![
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"item_id\":\"i1\",\"content_index\":0,\"delta\":\"hi\"}\n\n",
+        ])
+        .await;
+
+        assert_eq!(body.matches("event: content_block_stop").count(), 1);
+        assert_eq!(body.matches("event: message_delta").count(), 1);
+        assert_eq!(body.matches("event: message_stop").count(), 1);
+        assert!(!body.contains("event: error"));
+    }
+
+    /// `response.failed` falls through the event match, so it lands in the same tail path.
+    #[tokio::test]
+    async fn upstream_failure_event_terminates_the_message() {
+        let body = collect(vec![
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "event: response.failed\ndata: {\"response\":{\"id\":\"resp_1\",\"status\":\"failed\"}}\n\n",
+        ])
+        .await;
+
+        assert_eq!(body.matches("event: message_stop").count(), 1);
+    }
+
+    /// Nothing was ever emitted, so there is no message to stop: fail loudly.
+    #[tokio::test]
+    async fn upstream_stream_with_no_content_at_all_emits_an_error_event() {
+        let body = collect(vec![": keep-alive\n\n"]).await;
+
+        assert!(body.contains("event: error"));
+        assert!(!body.contains("event: message_stop"));
+    }
+
+    /// The normal path must not gain a duplicate terminator from the truncation handling.
+    #[tokio::test]
+    async fn normal_completed_event_terminates_exactly_once() {
+        let body = collect(vec![
+            "event: response.created\ndata: {\"response\":{\"id\":\"resp_1\",\"model\":\"m\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"item_id\":\"i1\",\"content_index\":0,\"delta\":\"hi\"}\n\n",
+            "event: response.completed\ndata: {\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"model\":\"m\"}}\n\n",
+        ])
+        .await;
+
+        assert_eq!(body.matches("event: message_stop").count(), 1);
+        assert_eq!(body.matches("event: message_delta").count(), 1);
+        assert_eq!(body.matches("event: content_block_stop").count(), 1);
+        assert!(!body.contains("event: error"));
+    }
 }
