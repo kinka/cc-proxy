@@ -324,6 +324,64 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                 }
             }
         }
+
+        // Upstream ended the SSE body without ever sending `[DONE]`. Without this block the loop
+        // just falls off the end, and that is silent on every side at once: the client gets a
+        // `200` stream with no `message_stop` (agents read that as an empty reply), and the
+        // request leaves *no* log line at all — neither `request.done` nor `request.error` — so
+        // the only trace is an unpaired `request.start`. Close the message out and say so.
+        if !logged_completion {
+            if has_sent_message_start {
+                if let Some(index) = current_non_tool_block_index.take() {
+                    let event = json!({ "type": "content_block_stop", "index": index });
+                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+                }
+                for open_index in open_tool_block_indices.drain() {
+                    let event = json!({ "type": "content_block_stop", "index": open_index });
+                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+                }
+                let event = json!({
+                    "type": "message_delta",
+                    "delta": {
+                        "stop_reason": pending_finish_reason.unwrap_or("end_turn"),
+                        "stop_sequence": null,
+                    },
+                    "usage": pending_usage.clone(),
+                });
+                yield Ok(Bytes::from(format!("event: message_delta\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+                if !sent_message_stop {
+                    yield Ok(Bytes::from("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+                }
+            } else {
+                // Nothing was ever emitted, so there is no message to stop. Fail loudly instead
+                // of handing back an empty `200`.
+                let event = json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "upstream closed the stream before sending any content",
+                    }
+                });
+                yield Ok(Bytes::from(format!("event: error\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
+            }
+
+            log::error!(
+                "request.error req_id={} path={} stage=stream_truncated api_format={} stream=true latency_ms={} response_id={} response_model={} finish_reason={} sent_message_start={} has_tool_use={} has_thinking={} thinking_chars={} text_chars={} trailing_bytes={} error=upstream stream ended without [DONE]",
+                request_context.req_id,
+                request_context.path,
+                request_context.api_format,
+                request_context.started_at.elapsed().as_millis(),
+                message_id.as_deref().unwrap_or(""),
+                current_model.as_deref().unwrap_or(""),
+                pending_finish_reason.unwrap_or(""),
+                has_sent_message_start,
+                saw_tool_use,
+                saw_thinking,
+                thinking_chars,
+                text_chars,
+                buffer.len(),
+            );
+        }
     }
 }
 
@@ -351,5 +409,67 @@ fn update_tool_state(state: &mut ToolBlockState, tool_call: &DeltaToolCall) {
         .and_then(|function| function.name.as_ref())
     {
         state.name = name.clone();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RequestLogContext;
+    use std::time::Instant;
+
+    fn collect(chunks: Vec<&'static str>) -> String {
+        let stream = futures::stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
+        );
+        let context = RequestLogContext {
+            req_id: 1,
+            path: "/v1/messages".to_string(),
+            api_format: "openai_chat",
+            started_at: Instant::now(),
+        };
+        let out = create_anthropic_sse_stream(stream, context);
+        futures::executor::block_on(async move {
+            futures::pin_mut!(out);
+            let mut acc = String::new();
+            while let Some(item) = out.next().await {
+                acc.push_str(&String::from_utf8_lossy(&item.unwrap()));
+            }
+            acc
+        })
+    }
+
+    /// An upstream that closes mid-turn must still produce a terminated Anthropic message;
+    /// otherwise the client sees a `200` stream that never ends and reads it as an empty reply.
+    #[test]
+    fn upstream_stream_without_done_still_terminates_the_message() {
+        let body = collect(vec![
+            "data: {\"id\":\"chatcmpl-1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+        ]);
+        assert!(body.contains("event: message_start"));
+        assert!(body.contains("event: message_delta"));
+        assert!(body.contains("event: message_stop"));
+    }
+
+    /// Nothing was ever emitted, so there is no message to stop: fail loudly instead.
+    #[test]
+    fn upstream_stream_with_no_content_at_all_emits_an_error_event() {
+        let body = collect(vec![]);
+        assert!(body.contains("event: error"));
+        assert!(!body.contains("event: message_stop"));
+    }
+
+    /// The normal path must not gain a duplicate terminator from the truncation handling.
+    #[test]
+    fn normal_done_sentinel_terminates_exactly_once() {
+        let body = collect(vec![
+            "data: {\"id\":\"chatcmpl-1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ]);
+        assert_eq!(body.matches("event: message_stop").count(), 1);
+        assert_eq!(body.matches("event: message_delta").count(), 1);
+        assert!(!body.contains("event: error"));
     }
 }
