@@ -11,3 +11,8 @@ upstream:
     claude-sonnet-4-20250514: "gpt-5"
     claude-opus-4-20250514: "gpt-5"
   extra_headers: {}
+  # Extra top-level fields merged into the upstream request body, for sampling knobs
+  # with no Anthropic equivalent. Applies to every model routed through this upstream.
+  extra_body: {}
+  # extra_body:
+  #   repetition_penalty: 1.1

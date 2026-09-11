@@ -58,8 +58,33 @@ Then edit:
 - `upstream.api_format`
 - `upstream.model_map`
 - `upstream.extra_headers`
+- `upstream.extra_body`
 
 Local configs use `*.local.yaml` and are ignored by git.
+
+### `extra_body`
+
+Top-level fields merged into the upstream request body after translation. This is the
+escape hatch for upstream-specific sampling knobs that have no Anthropic equivalent, so
+clients never have to send them:
+
+```yaml
+upstream:
+  extra_body:
+    repetition_penalty: 1.1
+```
+
+Notes:
+
+- It applies to **every model routed through that upstream**. Give a model its own
+  `providers` entry when the knob should not be shared.
+- Values override whatever the translation produced.
+- Structural fields (`model`, `messages`, `input`, `tools`, `stream`, `max_tokens`,
+  `max_completion_tokens`) are refused and logged, so a config typo cannot turn into an
+  opaque upstream `400`.
+- Unknown fields are forwarded as-is; an upstream that does not recognize a knob may
+  either ignore it or reject the request, so verify against that upstream before relying
+  on it.
 
 ## Local Run
 

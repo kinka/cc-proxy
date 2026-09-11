@@ -12,6 +12,12 @@ upstream:
     claude-sonnet-4-20250514: "gpt-5"
     claude-opus-4-20250514: "gpt-5"
   extra_headers: {}
+  # Extra top-level fields merged into the upstream request body, for sampling knobs
+  # with no Anthropic equivalent. Applies to every model routed through this upstream —
+  # give a model its own `providers` entry when the knob should not be shared.
+  extra_body: {}
+  # extra_body:
+  #   repetition_penalty: 1.1
 
 # Optional: Configure multiple different backend connections (providers).
 # When a client requests a model via "provider_name/model_name", the proxy will strip 

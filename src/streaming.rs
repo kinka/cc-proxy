@@ -37,6 +37,10 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         });
         let mut saw_thinking = false;
         let mut saw_tool_use = false;
+        // Counted on the way past rather than buffered: the whole point is to spot a model
+        // that reasons and answers at comparable length without ever holding its output.
+        let mut thinking_chars = 0usize;
+        let mut text_chars = 0usize;
         let mut logged_completion = false;
         let mut sent_message_stop = false;
         let mut pending_finish_reason: Option<&'static str> = None;
@@ -102,6 +106,8 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                                     cache_creation_input_tokens: pending_usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()),
                                     has_tool_use: saw_tool_use,
                                     has_thinking: saw_thinking,
+                                    thinking_chars,
+                                    text_chars,
                                 },
                                 true,
                             );
@@ -168,6 +174,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
                     if let Some(reasoning) = reasoning_text {
                         saw_thinking = true;
+                        thinking_chars += reasoning.chars().count();
                         if current_non_tool_block_type != Some("thinking") {
                             if let Some(index) = current_non_tool_block_index.take() {
                                 let event = json!({ "type": "content_block_stop", "index": index });
@@ -203,6 +210,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
 
                     if let Some(content) = &choice.delta.content {
                         if !content.is_empty() {
+                            text_chars += content.chars().count();
                             if current_non_tool_block_type != Some("text") {
                                 if let Some(index) = current_non_tool_block_index.take() {
                                     let event = json!({ "type": "content_block_stop", "index": index });

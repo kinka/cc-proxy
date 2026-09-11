@@ -53,6 +53,17 @@ struct ResponseLogSummary {
     cache_creation_input_tokens: Option<u64>,
     has_tool_use: bool,
     has_thinking: bool,
+    /// Visible-text and reasoning sizes, in Unicode chars rather than bytes so a
+    /// Chinese reply is not counted as three times its length.
+    ///
+    /// These exist to make one specific failure visible without capturing bodies:
+    /// a model that drafts the whole answer inside its reasoning and then writes it
+    /// out again. It shows up as reasoning and text being of comparable size on a
+    /// turn that produced one short answer, and it costs real output tokens on top
+    /// of leaking the reasoning into the user-visible reply. Counts only — the
+    /// content itself is business data and must not reach the log.
+    thinking_chars: usize,
+    text_chars: usize,
 }
 
 #[derive(Clone)]
@@ -216,6 +227,8 @@ async fn handle_messages_internal(
         ),
     }
     .map_err(|err| internal_error_with_context(req_id, &path, "transform_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+
+    let transformed_body = apply_extra_body(req_id, transformed_body, &upstream.extra_body);
 
     let endpoint = match api_format {
         ApiFormat::OpenAiChat => "/chat/completions",
@@ -386,6 +399,7 @@ async fn handle_responses_internal(
 
     let transformed_body = transform_responses::responses_request_to_openai_chat(mapped_body)
         .map_err(|err| internal_error_with_context(req_id, &path, "transform_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+    let transformed_body = apply_extra_body(req_id, transformed_body, &upstream.extra_body);
     let upstream_url = build_upstream_url(&upstream.base_url, "/chat/completions");
     let payload = serde_json::to_vec(&transformed_body)
         .map_err(|err| internal_error_with_context(req_id, &path, "serialize_upstream_request", Some(api_format_name), Some(is_stream), started_at, err))?;
@@ -548,7 +562,19 @@ fn summarize_anthropic_response(body: &Value) -> ResponseLogSummary {
             .and_then(|value| value.as_u64()),
         has_tool_use: content.iter().any(|part| part.get("type").and_then(|value| value.as_str()) == Some("tool_use")),
         has_thinking: content.iter().any(|part| part.get("type").and_then(|value| value.as_str()) == Some("thinking")),
+        thinking_chars: count_part_chars(&content, "thinking", "thinking"),
+        text_chars: count_part_chars(&content, "text", "text"),
     }
+}
+
+/// Sum the chars of every `type == part_type` block, reading the field named `field`.
+fn count_part_chars(parts: &[Value], part_type: &str, field: &str) -> usize {
+    parts
+        .iter()
+        .filter(|part| part.get("type").and_then(|value| value.as_str()) == Some(part_type))
+        .filter_map(|part| part.get(field).and_then(|value| value.as_str()))
+        .map(|text| text.chars().count())
+        .sum()
 }
 
 fn summarize_responses_response(body: &Value) -> ResponseLogSummary {
@@ -567,7 +593,28 @@ fn summarize_responses_response(body: &Value) -> ResponseLogSummary {
         cache_creation_input_tokens: None,
         has_tool_use: output.is_some_and(|items| items.iter().any(|part| part.get("type").and_then(|value| value.as_str()) == Some("function_call"))),
         has_thinking: output.is_some_and(|items| items.iter().any(|part| part.get("type").and_then(|value| value.as_str()) == Some("reasoning"))),
+        // Responses nests one level deeper than Chat: reasoning carries `summary[].summary_text`,
+        // the answer carries `message.content[].output_text`.
+        thinking_chars: output.map_or(0, |items| count_nested_chars(items, "reasoning", "summary", &["summary_text"])),
+        text_chars: output.map_or(0, |items| count_nested_chars(items, "message", "content", &["output_text", "text"])),
     }
+}
+
+/// Sum the chars of `child_types` parts found under `child_key` of every `item_type` item.
+fn count_nested_chars(items: &[Value], item_type: &str, child_key: &str, child_types: &[&str]) -> usize {
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(|value| value.as_str()) == Some(item_type))
+        .filter_map(|item| item.get(child_key).and_then(|value| value.as_array()))
+        .flatten()
+        .filter(|part| {
+            part.get("type")
+                .and_then(|value| value.as_str())
+                .is_some_and(|found| child_types.contains(&found))
+        })
+        .filter_map(|part| part.get("text").and_then(|value| value.as_str()))
+        .map(|text| text.chars().count())
+        .sum()
 }
 
 pub(crate) fn log_request_done(
@@ -577,7 +624,7 @@ pub(crate) fn log_request_done(
     is_stream: bool,
 ) {
     log::info!(
-        "request.done req_id={} path={} stream={} api_format={} status={} latency_ms={} response_id={} response_model={} stop_reason={} input_tokens={} output_tokens={} cache_read_input_tokens={} cache_creation_input_tokens={} has_tool_use={} has_thinking={}",
+        "request.done req_id={} path={} stream={} api_format={} status={} latency_ms={} response_id={} response_model={} stop_reason={} input_tokens={} output_tokens={} cache_read_input_tokens={} cache_creation_input_tokens={} has_tool_use={} has_thinking={} thinking_chars={} text_chars={}",
         context.req_id,
         context.path,
         is_stream,
@@ -601,6 +648,8 @@ pub(crate) fn log_request_done(
             .unwrap_or(""),
         summary.has_tool_use,
         summary.has_thinking,
+        summary.thinking_chars,
+        summary.text_chars,
     );
 }
 
@@ -693,6 +742,37 @@ fn resolve_config_path() -> Result<PathBuf> {
     }
 
     Ok(Path::new("config").join("proxy.local.yaml"))
+}
+
+/// Merge configured `extra_body` fields into the request that is about to leave for
+/// the upstream, so sampling knobs with no Anthropic equivalent (`repetition_penalty`
+/// and friends) can be pinned per provider without the client knowing about them.
+///
+/// Reserved keys are dropped with a warning rather than applied: a typo there would
+/// otherwise surface as an opaque upstream 400 with nothing pointing back at the config.
+fn apply_extra_body(
+    req_id: u64,
+    mut body: Value,
+    extra_body: &std::collections::HashMap<String, Value>,
+) -> Value {
+    if extra_body.is_empty() {
+        return body;
+    }
+    let Some(object) = body.as_object_mut() else {
+        return body;
+    };
+    for (key, value) in extra_body {
+        if config::RESERVED_EXTRA_BODY_KEYS.contains(&key.as_str()) {
+            log::warn!(
+                "req_id={} ignoring reserved extra_body field key={}",
+                req_id,
+                key
+            );
+            continue;
+        }
+        object.insert(key.clone(), value.clone());
+    }
+    body
 }
 
 fn build_upstream_url(base_url: &str, endpoint: &str) -> String {
@@ -888,6 +968,41 @@ mod main_tests {
     use axum::http::HeaderMap;
     use std::collections::HashMap;
 
+    /// The 2026-09-10 shape this field exists for: the model drafts the whole answer inside
+    /// its reasoning, then writes it again as visible text. Both sides must be counted in
+    /// chars — measured in bytes a Chinese reply reads as three times its real length and
+    /// the "reasoned and answered twice" ratio stops meaning anything.
+    #[test]
+    fn test_summarize_counts_thinking_and_text_in_chars() {
+        let body = json!({
+            "content": [
+                { "type": "thinking", "thinking": "用户要求补充工时" },
+                { "type": "text", "text": "已成功追加" },
+                { "type": "text", "text": "ok" },
+            ]
+        });
+        let summary = summarize_anthropic_response(&body);
+        assert!(summary.has_thinking);
+        assert_eq!(summary.thinking_chars, 8);
+        assert_eq!(summary.text_chars, 7);
+    }
+
+    #[test]
+    fn test_summarize_responses_counts_nested_parts() {
+        let body = json!({
+            "output": [
+                { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "推理" }] },
+                { "type": "message", "content": [
+                    { "type": "output_text", "text": "答案" },
+                    { "type": "refusal", "text": "不该计入" },
+                ] },
+            ]
+        });
+        let summary = summarize_responses_response(&body);
+        assert_eq!(summary.thinking_chars, 2);
+        assert_eq!(summary.text_chars, 2);
+    }
+
     #[test]
     fn test_get_request_api_key() {
         let mut headers = HeaderMap::new();
@@ -923,6 +1038,42 @@ mod main_tests {
     }
 
     #[test]
+    fn test_apply_extra_body_merges_and_overrides() {
+        let mut extra = HashMap::new();
+        extra.insert("repetition_penalty".to_string(), json!(1.1));
+        extra.insert("temperature".to_string(), json!(0.2));
+
+        let body = json!({ "model": "qwen", "messages": [], "temperature": 1.0 });
+        let merged = apply_extra_body(1, body, &extra);
+
+        assert_eq!(merged["repetition_penalty"], json!(1.1));
+        assert_eq!(merged["temperature"], json!(0.2));
+        assert_eq!(merged["model"], json!("qwen"));
+    }
+
+    #[test]
+    fn test_apply_extra_body_refuses_reserved_keys() {
+        let mut extra = HashMap::new();
+        extra.insert("model".to_string(), json!("hijacked"));
+        extra.insert("messages".to_string(), json!([]));
+        extra.insert("repetition_penalty".to_string(), json!(1.2));
+
+        let body = json!({ "model": "qwen", "messages": [{ "role": "user" }] });
+        let merged = apply_extra_body(1, body, &extra);
+
+        assert_eq!(merged["model"], json!("qwen"));
+        assert_eq!(merged["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(merged["repetition_penalty"], json!(1.2));
+    }
+
+    #[test]
+    fn test_apply_extra_body_is_a_noop_when_empty() {
+        let body = json!({ "model": "qwen" });
+        let merged = apply_extra_body(1, body.clone(), &HashMap::new());
+        assert_eq!(merged, body);
+    }
+
+    #[test]
     fn test_resolve_upstream_and_body() {
         let default_upstream = UpstreamConfig {
             base_url: "http://default".to_string(),
@@ -935,6 +1086,7 @@ mod main_tests {
             vision_model: None,
             strip_tool_result_images: false,
             extra_headers: HashMap::new(),
+            extra_body: HashMap::new(),
         };
 
         let provider_upstream = UpstreamConfig {
@@ -948,6 +1100,7 @@ mod main_tests {
             vision_model: None,
             strip_tool_result_images: false,
             extra_headers: HashMap::new(),
+            extra_body: HashMap::new(),
         };
 
         let mut providers = HashMap::new();

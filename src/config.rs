@@ -35,7 +35,23 @@ pub struct UpstreamConfig {
     pub strip_tool_result_images: bool,
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
+    /// Extra top-level fields merged into the upstream request body after transform.
+    ///
+    /// This is the escape hatch for upstream-specific sampling knobs that have no
+    /// Anthropic equivalent, so the client never has to know about them — e.g.
+    /// `repetition_penalty` on a Qwen-backed gateway, which is the only guardrail
+    /// against a model looping on the same reasoning verbatim.
+    ///
+    /// Values override whatever the transform produced. Structural fields
+    /// (see `RESERVED_EXTRA_BODY_KEYS`) are refused, since overriding those turns a
+    /// config typo into a malformed request that is hard to trace back here.
+    #[serde(default)]
+    pub extra_body: HashMap<String, serde_json::Value>,
 }
+
+/// Fields `extra_body` must never touch: they carry the translated request itself.
+pub const RESERVED_EXTRA_BODY_KEYS: &[&str] =
+    &["model", "messages", "input", "tools", "stream", "max_tokens", "max_completion_tokens"];
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 pub enum ApiFormat {

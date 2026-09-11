@@ -24,6 +24,9 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
         let mut tool_index_by_item_id: HashMap<String, u32> = HashMap::new();
         let mut last_tool_index: Option<u32> = None;
         let mut saw_thinking = false;
+        // Same intent as the Chat adapter: a size-only signal for "reasoned and answered twice".
+        let mut thinking_chars = 0usize;
+        let mut text_chars = 0usize;
         let mut logged_completion = false;
         let mut sent_message_stop = false;
 
@@ -152,6 +155,7 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                         let Some(delta) = data.get("delta").and_then(|value| value.as_str()) else {
                             continue;
                         };
+                        text_chars += delta.chars().count();
 
                         let index = current_text_index.unwrap_or_else(|| {
                             let assigned = resolve_content_index(
@@ -252,6 +256,7 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                             continue;
                         };
                         saw_thinking = true;
+                        thinking_chars += delta.chars().count();
 
                         let index = resolve_content_index(
                             &data,
@@ -328,6 +333,8 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                                     cache_creation_input_tokens: usage.get("cache_creation_input_tokens").and_then(|value| value.as_u64()),
                                     has_tool_use,
                                     has_thinking: saw_thinking,
+                                    thinking_chars,
+                                    text_chars,
                                 },
                                 true,
                             );

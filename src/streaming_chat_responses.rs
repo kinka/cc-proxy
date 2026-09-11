@@ -130,7 +130,12 @@ pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'stat
                                     cache_read_input_tokens: pending_usage.pointer("/input_tokens_details/cached_tokens").and_then(|value| value.as_u64()),
                                     cache_creation_input_tokens: None,
                                     has_tool_use: !tool_calls_by_index.is_empty(),
+                                    // This adapter has never surfaced reasoning, so 0 here means
+                                    // "not tracked", not "the model did not reason" — read it
+                                    // together with has_thinking before drawing conclusions.
                                     has_thinking: false,
+                                    thinking_chars: 0,
+                                    text_chars: completed_output_text.chars().count(),
                                 },
                                 true,
                             );
