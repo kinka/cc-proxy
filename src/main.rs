@@ -1,6 +1,7 @@
 mod config;
 mod sse;
 mod streaming;
+mod streaming_anthropic;
 mod streaming_chat_responses;
 mod streaming_responses;
 mod transform;
@@ -52,10 +53,11 @@ impl RequestLogContext {
         Self { req_id: 1, path: path.to_string(), api_format, started_at: Instant::now(), usage: None }
     }
 
-    /// Only the Chat Completions → Anthropic conversion reports `input_tokens` net of cache;
-    /// every Responses-API-shaped usage counts cached input inside `input_tokens`.
+    /// Native Anthropic usage and the Chat Completions → Anthropic conversion both report
+    /// `input_tokens` net of cache; every Responses-API-shaped usage counts cached input inside
+    /// `input_tokens`.
     pub(crate) fn input_includes_cache(&self) -> bool {
-        self.api_format != "openai_chat"
+        !matches!(self.api_format, "openai_chat" | "anthropic")
     }
 
     /// Settle this request in the ledger. The first call wins; later ones are no-ops.
@@ -410,6 +412,7 @@ async fn handle_messages_internal(
             mapped_body,
             upstream.prompt_cache_key.as_deref(),
         ),
+        ApiFormat::Anthropic => Ok(mapped_body),
     }
     .map_err(|err| request_context.internal_error("transform_request", is_stream, err))?;
 
@@ -418,6 +421,7 @@ async fn handle_messages_internal(
     let endpoint = match api_format {
         ApiFormat::OpenAiChat => "/chat/completions",
         ApiFormat::OpenAiResponses => "/responses",
+        ApiFormat::Anthropic => "/messages",
     };
     let upstream_url = build_upstream_url(&upstream.base_url, endpoint);
 
@@ -436,6 +440,11 @@ async fn handle_messages_internal(
 
     for (name, value) in trace_headers_to_forward(&parts.headers, &upstream.extra_headers) {
         upstream_request = upstream_request.header(name, value);
+    }
+    if api_format == ApiFormat::Anthropic {
+        for (name, value) in anthropic_headers_to_forward(&parts.headers, &upstream.extra_headers) {
+            upstream_request = upstream_request.header(name, value);
+        }
     }
     for (name, value) in &upstream.extra_headers {
         upstream_request = upstream_request.header(name, value);
@@ -469,6 +478,13 @@ async fn handle_messages_internal(
             sanitize_error_message(&message),
         );
         request_context.record(Outcome::UpstreamError, Some(upstream_status.as_u16()), TokenCounts::default(), None);
+        // An Anthropic upstream already speaks the client's error shape; keep its error type
+        // (`overloaded_error`, `rate_limit_error` …) so the client's retry logic still works.
+        if api_format == ApiFormat::Anthropic {
+            if let Some(response) = passthrough_anthropic_error(upstream_status, &body) {
+                return Err(response);
+            }
+        }
         return Err(anthropic_error_response(upstream_status, &message));
     }
 
@@ -483,6 +499,9 @@ async fn handle_messages_internal(
             ApiFormat::OpenAiChat => Box::pin(streaming::create_anthropic_sse_stream(stream, request_context.clone())),
             ApiFormat::OpenAiResponses => Box::pin(
                 streaming_responses::create_anthropic_sse_stream_from_responses(stream, request_context.clone()),
+            ),
+            ApiFormat::Anthropic => Box::pin(
+                streaming_anthropic::create_passthrough_sse_stream(stream, request_context.clone()),
             ),
         };
 
@@ -501,16 +520,25 @@ async fn handle_messages_internal(
         .map_err(|err| request_context.transport_error(is_stream, err))?;
     let parsed: Value = serde_json::from_slice(&upstream_body)
         .map_err(|err| request_context.internal_error("parse_upstream_json", is_stream, err))?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+    if api_format == ApiFormat::Anthropic {
+        // Parsed only for the ledger; the client gets the upstream bytes as they came.
+        log_request_done(&request_context, upstream_status, &summarize_anthropic_response(&parsed), false);
+        return Ok((StatusCode::OK, headers, Body::from(upstream_body)).into_response());
+    }
+
     let anthropic_body = match api_format {
         ApiFormat::OpenAiChat => transform::openai_to_anthropic(parsed),
         ApiFormat::OpenAiResponses => transform_responses::responses_to_anthropic(parsed),
+        ApiFormat::Anthropic => Ok(parsed),
     }
     .map_err(|err| request_context.internal_error("transform_upstream_response", is_stream, err))?;
 
     log_request_done(&request_context, upstream_status, &summarize_anthropic_response(&anthropic_body), false);
 
-    let mut headers = HeaderMap::new();
-    headers.insert("content-type", HeaderValue::from_static("application/json"));
     Ok((StatusCode::OK, headers, Json(anthropic_body)).into_response())
 }
 
@@ -564,6 +592,19 @@ async fn handle_responses_internal(
 
     let provider_name = resolved_provider_name(&request_body, &state.config, provider_from_path.as_deref());
     let (upstream, request_body) = resolve_upstream_and_body(request_body, &state.config, provider_from_path.as_deref());
+
+    // This route always translates to Chat Completions; an Anthropic upstream has no such endpoint.
+    if upstream.api_format == ApiFormat::Anthropic {
+        log::warn!(
+            "request.rejected req_id={} path={} reason=responses_route_on_anthropic_upstream",
+            req_id,
+            path,
+        );
+        return Err(openai_error_response(
+            reqwest::StatusCode::BAD_REQUEST,
+            "this upstream uses api_format=anthropic; send Anthropic Messages requests to /v1/messages instead of /v1/responses",
+        ));
+    }
 
     let mapped_body = apply_model_mapping(request_body, &upstream.model_map, upstream.default_model.as_deref());
     let mapped_model = mapped_body
@@ -693,7 +734,43 @@ fn api_format_name(api_format: ApiFormat) -> &'static str {
     match api_format {
         ApiFormat::OpenAiChat => "openai_chat",
         ApiFormat::OpenAiResponses => "openai_responses",
+        ApiFormat::Anthropic => "anthropic",
     }
+}
+
+/// Protocol headers an Anthropic upstream needs from the client: the API version, and the
+/// beta flags that switch on features the body already relies on (a request using a beta
+/// field without its flag is a 400). `extra_headers` wins, same rule as the trace headers.
+fn anthropic_headers_to_forward(
+    incoming: &HeaderMap,
+    extra_headers: &std::collections::HashMap<String, String>,
+) -> Vec<(&'static str, HeaderValue)> {
+    const DEFAULT_ANTHROPIC_VERSION: &str = "2023-06-01";
+    let pinned = |name: &str| extra_headers.keys().any(|key| key.eq_ignore_ascii_case(name));
+    let mut headers = Vec::new();
+    if !pinned("anthropic-version") {
+        let version = incoming
+            .get("anthropic-version")
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static(DEFAULT_ANTHROPIC_VERSION));
+        headers.push(("anthropic-version", version));
+    }
+    if !pinned("anthropic-beta") {
+        if let Some(beta) = incoming.get("anthropic-beta") {
+            headers.push(("anthropic-beta", beta.clone()));
+        }
+    }
+    headers
+}
+
+/// Relay an Anthropic-shaped error body as-is; `None` when the body is not one.
+fn passthrough_anthropic_error(status: reqwest::StatusCode, body: &str) -> Option<Response> {
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    if parsed.get("type").and_then(Value::as_str) != Some("error") || parsed.get("error").is_none() {
+        return None;
+    }
+    let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    Some((status, Json(parsed)).into_response())
 }
 
 fn env_var_is_set(name: &str) -> bool {
@@ -1206,6 +1283,51 @@ mod main_tests {
     use crate::config::{ListenConfig, UpstreamConfig, ApiFormat};
     use axum::http::HeaderMap;
     use std::collections::HashMap;
+
+    #[test]
+    fn anthropic_api_format_parses_and_targets_messages() {
+        let parsed: ApiFormat = serde_yaml::from_str("anthropic").unwrap();
+        assert_eq!(parsed, ApiFormat::Anthropic);
+        assert_eq!(build_upstream_url("https://gw.example.com", "/messages"), "https://gw.example.com/v1/messages");
+        assert_eq!(build_upstream_url("https://gw.example.com/v1/", "/messages"), "https://gw.example.com/v1/messages");
+    }
+
+    #[test]
+    fn anthropic_input_tokens_exclude_cache() {
+        assert!(!RequestLogContext::for_test("/v1/messages", "anthropic").input_includes_cache());
+        assert!(!RequestLogContext::for_test("/v1/messages", "openai_chat").input_includes_cache());
+        assert!(RequestLogContext::for_test("/v1/messages", "openai_responses").input_includes_cache());
+    }
+
+    #[test]
+    fn anthropic_protocol_headers_default_version_and_respect_extra_headers() {
+        let forwarded = anthropic_headers_to_forward(&HeaderMap::new(), &HashMap::new());
+        assert_eq!(forwarded.len(), 1);
+        assert_eq!(forwarded[0].0, "anthropic-version");
+        assert_eq!(forwarded[0].1, "2023-06-01");
+
+        let mut incoming = HeaderMap::new();
+        incoming.insert("anthropic-version", HeaderValue::from_static("2024-01-01"));
+        incoming.insert("anthropic-beta", HeaderValue::from_static("interleaved-thinking-2025-05-14"));
+        let forwarded = anthropic_headers_to_forward(&incoming, &HashMap::new());
+        let pairs: Vec<_> = forwarded.iter().map(|(name, value)| (*name, value.to_str().unwrap())).collect();
+        assert_eq!(pairs, vec![("anthropic-version", "2024-01-01"), ("anthropic-beta", "interleaved-thinking-2025-05-14")]);
+
+        let pinned = HashMap::from([("Anthropic-Version".to_string(), "2023-06-01".to_string())]);
+        let forwarded = anthropic_headers_to_forward(&incoming, &pinned);
+        let names: Vec<_> = forwarded.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["anthropic-beta"]);
+    }
+
+    #[test]
+    fn anthropic_error_bodies_pass_through_and_others_do_not() {
+        let body = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        let response = passthrough_anthropic_error(reqwest::StatusCode::from_u16(529).unwrap(), body).unwrap();
+        assert_eq!(response.status().as_u16(), 529);
+
+        assert!(passthrough_anthropic_error(reqwest::StatusCode::BAD_GATEWAY, "<html>bad gateway</html>").is_none());
+        assert!(passthrough_anthropic_error(reqwest::StatusCode::BAD_REQUEST, r#"{"error":{"message":"x"}}"#).is_none());
+    }
 
     /// The 2026-09-10 shape this field exists for: the model drafts the whole answer inside
     /// its reasoning, then writes it again as visible text. Both sides must be counted in

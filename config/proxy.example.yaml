@@ -42,6 +42,13 @@ providers:
     timeout_secs: 600
     default_model: "mimo-v2.5-pro"
     extra_headers: {}
+  # An upstream that already speaks Anthropic Messages: bodies pass through untouched
+  # (model mapping and extra_body still apply), auth is still `Authorization: Bearer`.
+  # anthropic-gw:
+  #   base_url: "https://anthropic-compatible-gateway.example.com"
+  #   api_key: "replace-me"
+  #   api_format: "anthropic"
+  #   timeout_secs: 600
 
 # Optional: per-request usage ledger + query API (`/usage/daily`, `/usage/sessions`).
 # Omit the section to disable both. One JSONL line per request, no bodies, files named

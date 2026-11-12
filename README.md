@@ -10,6 +10,7 @@ It accepts Anthropic-style `POST /v1/messages` requests from tools such as Claud
 - Supports `POST /claude/v1/messages`
 - Supports `api_format: openai_chat`
 - Supports `api_format: openai_responses`
+- Supports `api_format: anthropic` (passthrough, see below)
 - Supports non-streaming responses
 - Supports streaming SSE conversion
 - Supports model mapping
@@ -62,6 +63,24 @@ Then edit:
 - `upstream.extra_body`
 
 Local configs use `*.local.yaml` and are ignored by git.
+
+### `api_format: anthropic`
+
+For upstreams that already speak Anthropic Messages. Requests go to `<base_url>/v1/messages`
+with the body untouched apart from `model_map` / `default_model` / `vision_model` and
+`extra_body`; responses (JSON and SSE) come back byte for byte. What still differs from
+calling the upstream directly:
+
+- Auth is `Authorization: Bearer <api_key>`, same as the other formats — not `x-api-key`.
+- `anthropic-version` (default `2023-06-01`) and `anthropic-beta` are forwarded from the
+  client; `extra_headers` pins either one.
+- Upstream errors in Anthropic shape (`{"type":"error",...}`) are relayed with their status;
+  anything else is wrapped into one.
+- A stream that ends without `message_stop` gets a trailing `error` event, so the client
+  raises instead of reading a silently cut reply.
+- `/v1/responses` is refused for these upstreams.
+- The usage ledger adds cache reads/writes to the prompt count, since Anthropic's
+  `input_tokens` excludes them.
 
 ### `extra_body`
 

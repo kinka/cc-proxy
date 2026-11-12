@@ -71,6 +71,10 @@ pub enum ApiFormat {
     OpenAiChat,
     #[serde(rename = "openai_responses", alias = "open_ai_responses")]
     OpenAiResponses,
+    /// The upstream already speaks Anthropic Messages: the request and response bodies pass
+    /// through untouched (after model mapping and `extra_body`), auth stays `Bearer`.
+    #[serde(rename = "anthropic")]
+    Anthropic,
 }
 
 impl ProxyConfig {
