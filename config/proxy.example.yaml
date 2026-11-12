@@ -11,6 +11,18 @@ upstream:
   model_map:
     claude-sonnet-4-20250514: "gpt-5"
     claude-opus-4-20250514: "gpt-5"
+    # GF LLM gateway models (all speak the Anthropic protocol upstream too). Short names
+    # are aliases; the full `external-*` names map to themselves so they stay listed.
+    # Internal deployments (`internal-*`) are deliberately not aliased here.
+    qwen3.8-flash: "external-qwen3.8-flash"
+    qwen3.8-max: "external-qwen3.8-max"
+    glm-5.3-flash: "external-glm5.3-flash"
+    glm5.3-flash: "external-glm5.3-flash"
+    deepseek-v4-flash: "external-deepseek-v4-flash"
+    external-qwen3.8-flash: "external-qwen3.8-flash"
+    external-qwen3.8-max: "external-qwen3.8-max"
+    external-glm5.3-flash: "external-glm5.3-flash"
+    external-deepseek-v4-flash: "external-deepseek-v4-flash"
   extra_headers: {}
   # Extra top-level fields merged into the upstream request body, for sampling knobs
   # with no Anthropic equivalent. Applies to every model routed through this upstream —
