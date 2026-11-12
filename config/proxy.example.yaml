@@ -32,3 +32,9 @@ providers:
     default_model: "mimo-v2.5-pro"
     extra_headers: {}
 
+# Optional: per-request usage ledger + query API (`/usage/daily`, `/usage/sessions`).
+# Omit the section to disable both. One JSONL line per request, no bodies, files named
+# by Beijing date. The query routes are unauthenticated (counts and caller IDs only).
+# usage:
+#   dir: "/app/data/usage"
+#   retention_days: 90

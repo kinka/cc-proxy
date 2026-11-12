@@ -15,11 +15,12 @@ It accepts Anthropic-style `POST /v1/messages` requests from tools such as Claud
 - Supports model mapping
 - Supports tool calls and image input
 - Supports Docker-first deployment
+- Optional per-request usage ledger with a query API (see [Usage ledger](#usage-ledger))
 
 ## Non-goals
 
 - Multi-provider failover
-- Persistent state or database storage
+- Persistent state or database storage beyond the append-only usage ledger
 - Desktop UI integration
 - Host config takeover and restore
 - Raw header ordering and casing preservation
@@ -240,6 +241,48 @@ If you only want the local `/health` check:
 ```bash
 CONFIG_PATH=./config/gpt.yaml SKIP_REAL_REQUEST=1 ./scripts/test.sh
 ```
+
+## Usage ledger
+
+Enable with a `usage` section in the config:
+
+```yaml
+usage:
+  dir: "/app/data/usage"     # run.sh mounts $DATA_DIR (default ./data) at /app/data
+  retention_days: 90         # 0 keeps files forever
+```
+
+Every request that reaches the upstream-forwarding stage writes exactly one JSONL line to
+`<dir>/YYYY-MM-DD.jsonl` (Beijing date): models, outcome, status, latency, four token
+counts, and the caller identity. Request and response bodies are never written. Writes
+happen on a background thread; a failed write only logs a warning.
+
+`outcome` is one of `done`, `stream_truncated` (upstream closed without a terminator — the
+usage seen so far is kept), `client_aborted` (the caller dropped the connection first),
+`upstream_error`, `transport_error`, `internal_error`.
+
+`prompt_tokens` always **includes** cached input, whatever shape the upstream reported, so
+`total_tokens = prompt_tokens + output_tokens` matches how upstream quotas count.
+
+Identity comes from request headers:
+
+| Header | Forwarded upstream | Ledger field |
+|---|---|---|
+| `x-trace-identifier` | yes | `trace_id` |
+| `x-trace-identifier-type` | yes | `trace_type` |
+| `x-cura-session-id` | **no** | `cura_session_id` |
+| `x-cura-env` | **no** | `cura_env` |
+
+A value pinned in `extra_headers` wins over the forwarded trace header.
+
+Query (no auth; keep the proxy on the internal network):
+
+- `GET /usage/daily?date=YYYY-MM-DD[&env=prod]` — totals, outcome counts, and breakdowns
+  `by_user`, `by_model`, `by_env`, plus `unattributed` (requests without `x-trace-identifier`).
+  `date` defaults to today (Beijing).
+- `GET /usage/sessions?date=YYYY-MM-DD[&trace_id=alice]` — per `x-cura-session-id` totals.
+
+Results for past dates are cached in memory; today's are cached for 30 seconds.
 
 ## Claude Code
 

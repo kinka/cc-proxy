@@ -8,6 +8,18 @@ pub struct ProxyConfig {
     pub upstream: UpstreamConfig,
     #[serde(default)]
     pub providers: HashMap<String, UpstreamConfig>,
+    /// Token ledger. Absent means nothing is recorded and `/usage/*` does not exist.
+    #[serde(default)]
+    pub usage: Option<UsageConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageConfig {
+    /// Directory for `YYYY-MM-DD.jsonl` files (Beijing dates).
+    pub dir: String,
+    /// Days of files to keep; 0 keeps everything.
+    #[serde(default = "default_usage_retention_days")]
+    pub retention_days: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,4 +85,8 @@ impl ProxyConfig {
 
 fn default_timeout_secs() -> u64 {
     600
+}
+
+fn default_usage_retention_days() -> u32 {
+    90
 }

@@ -1,6 +1,7 @@
 use crate::sse::strip_sse_field;
 use crate::transform_responses::{build_anthropic_usage_from_responses, map_responses_stop_reason};
-use crate::{log_request_done, RequestLogContext, ResponseLogSummary};
+use crate::usage::Outcome;
+use crate::{log_request_done, RequestLogContext, ResponseLogSummary, UsageGuard};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -30,6 +31,9 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
         let mut logged_completion = false;
         let mut sent_message_stop = false;
 
+        // Settles `client_aborted` if the caller drops the body before any terminal path runs.
+        let usage_guard = UsageGuard::new(request_context.clone());
+
         tokio::pin!(stream);
 
         while let Some(chunk) = stream.next().await {
@@ -44,6 +48,7 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                         request_context.started_at.elapsed().as_millis(),
                         err,
                     );
+                    request_context.record(Outcome::TransportError, Some(200), usage_guard.partial, usage_guard.response_model.as_deref());
                     yield Err(std::io::Error::other(err.to_string()));
                     continue;
                 }
@@ -381,6 +386,7 @@ pub fn create_anthropic_sse_stream_from_responses<E: std::error::Error + Send + 
                 yield Ok(Bytes::from(format!("event: error\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
             }
 
+            request_context.record(Outcome::StreamTruncated, Some(200), usage_guard.partial, current_model.as_deref());
             log::error!(
                 "request.error req_id={} path={} stage=stream_truncated api_format={} stream=true latency_ms={} response_id={} response_model={} sent_message_start={} has_tool_use={} has_thinking={} thinking_chars={} text_chars={} trailing_bytes={} error=upstream stream ended without response.completed",
                 request_context.req_id,
@@ -470,7 +476,6 @@ fn tool_item_key_from_event(data: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use futures::TryStreamExt;
-    use std::time::Instant;
 
     async fn collect(chunks: Vec<&'static str>) -> String {
         let stream = futures::stream::iter(
@@ -478,12 +483,7 @@ mod tests {
                 .into_iter()
                 .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
         );
-        let context = RequestLogContext {
-            req_id: 1,
-            path: "/v1/messages".to_string(),
-            api_format: "openai_responses",
-            started_at: Instant::now(),
-        };
+        let context = RequestLogContext::for_test("/v1/messages", "openai_responses");
         create_anthropic_sse_stream_from_responses(stream, context)
             .try_fold(String::new(), |mut body, bytes| async move {
                 body.push_str(&String::from_utf8(bytes.to_vec()).unwrap());

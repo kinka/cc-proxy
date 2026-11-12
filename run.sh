@@ -8,6 +8,8 @@ HOST_PORT="${HOST_PORT:-25721}"
 CONTAINER_PORT="${CONTAINER_PORT:-25721}"
 IMAGE_TAG="${IMAGE_TAG:-}"
 RUST_LOG="${RUST_LOG:-info}"
+# Holds the usage ledger when the config enables `usage` (point `usage.dir` under /app/data).
+DATA_DIR="${DATA_DIR:-$ROOT_DIR/data}"
 
 if [ -z "${CONFIG_PATH:-}" ]; then
     for candidate in \
@@ -42,6 +44,7 @@ if [ ! -f "$CONFIG_PATH" ]; then
 fi
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+mkdir -p "$DATA_DIR"
 
 RUN_ARGS=(
     -d
@@ -49,6 +52,7 @@ RUN_ARGS=(
     --restart unless-stopped
     -p "${HOST_PORT}:${CONTAINER_PORT}"
     -v "${CONFIG_PATH}:/app/config/proxy.yaml:ro"
+    -v "${DATA_DIR}:/app/data"
 )
 
 DOCKER_VERSION_TEXT="$(docker version 2>/dev/null || true)"
@@ -75,6 +79,7 @@ docker run "${RUN_ARGS[@]}" "$IMAGE_TAG" >/dev/null
 echo "Started ${CONTAINER_NAME}"
 echo "Image: ${IMAGE_TAG}"
 echo "Config: ${CONFIG_PATH}"
+echo "Data: ${DATA_DIR}"
 echo "Endpoint: http://0.0.0.0:${HOST_PORT}"
 echo "Recent logs:"
 docker logs --tail 20 "$CONTAINER_NAME" 2>&1 || true

@@ -5,12 +5,14 @@ mod streaming_chat_responses;
 mod streaming_responses;
 mod transform;
 mod transform_responses;
+mod usage;
 
 use crate::config::{ApiFormat, ProxyConfig, UpstreamConfig};
+use crate::usage::{Outcome, QueryError, RequestIdentity, TokenCounts, UsageMeta, UsageQuery, UsageRecorder, UsageTracking};
 use anyhow::{Context, Result};
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -40,6 +42,80 @@ pub(crate) struct RequestLogContext {
     pub(crate) path: String,
     pub(crate) api_format: &'static str,
     pub(crate) started_at: Instant,
+    /// Ledger handle; `None` when the `usage` config section is absent.
+    pub(crate) usage: Option<Arc<UsageTracking>>,
+}
+
+impl RequestLogContext {
+    #[cfg(test)]
+    pub(crate) fn for_test(path: &str, api_format: &'static str) -> Self {
+        Self { req_id: 1, path: path.to_string(), api_format, started_at: Instant::now(), usage: None }
+    }
+
+    /// Only the Chat Completions → Anthropic conversion reports `input_tokens` net of cache;
+    /// every Responses-API-shaped usage counts cached input inside `input_tokens`.
+    pub(crate) fn input_includes_cache(&self) -> bool {
+        self.api_format != "openai_chat"
+    }
+
+    /// Settle this request in the ledger. The first call wins; later ones are no-ops.
+    pub(crate) fn record(&self, outcome: Outcome, status: Option<u16>, tokens: TokenCounts, response_model: Option<&str>) {
+        if let Some(usage) = &self.usage {
+            usage.settle(self.req_id, &self.path, self.api_format, self.started_at, outcome, status, tokens, response_model);
+        }
+    }
+
+    fn internal_error(&self, stage: &str, is_stream: bool, err: impl std::fmt::Display) -> Response {
+        self.record(Outcome::InternalError, Some(500), TokenCounts::default(), None);
+        internal_error_with_context(self.req_id, &self.path, stage, Some(self.api_format), Some(is_stream), self.started_at, err)
+    }
+
+    fn transport_error(&self, is_stream: bool, err: impl std::fmt::Display) -> Response {
+        self.record(Outcome::TransportError, Some(502), TokenCounts::default(), None);
+        upstream_transport_error_with_context(self.req_id, &self.path, self.api_format, is_stream, self.started_at, err)
+    }
+}
+
+/// Records `client_aborted` for a request nothing else settled.
+///
+/// The case it exists for: the caller cancels a turn or its process dies mid-request, axum
+/// drops the handler future or the response body, and none of the terminal paths runs. The
+/// upstream may well have billed for it. `partial` carries whatever usage the stream had seen
+/// so far — usually nothing, since providers send usage in the last chunk, but the request is
+/// still counted so the gap is measurable.
+pub(crate) struct UsageGuard {
+    context: RequestLogContext,
+    pub(crate) partial: TokenCounts,
+    pub(crate) response_model: Option<String>,
+    armed: bool,
+}
+
+impl UsageGuard {
+    pub(crate) fn new(context: RequestLogContext) -> Self {
+        Self { context, partial: TokenCounts::default(), response_model: None, armed: true }
+    }
+
+    /// Hand responsibility to someone else (the handler does this once a stream takes over).
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UsageGuard {
+    fn drop(&mut self) {
+        if !self.armed || self.context.usage.as_ref().is_none_or(|usage| usage.is_settled()) {
+            return;
+        }
+        log::warn!(
+            "request.client_aborted req_id={} path={} api_format={} latency_ms={} partial_total_tokens={}",
+            self.context.req_id,
+            self.context.path,
+            self.context.api_format,
+            self.context.started_at.elapsed().as_millis(),
+            self.partial.total(),
+        );
+        self.context.record(Outcome::ClientAborted, None, self.partial, self.response_model.as_deref());
+    }
 }
 
 #[derive(Debug, Default)]
@@ -70,6 +146,8 @@ struct ResponseLogSummary {
 struct AppState {
     config: Arc<ProxyConfig>,
     client: Client,
+    usage_recorder: Option<UsageRecorder>,
+    usage_query: Option<Arc<UsageQuery>>,
 }
 
 #[tokio::main]
@@ -88,10 +166,22 @@ async fn main() -> Result<()> {
         .build()
         .context("failed to build reqwest client")?;
 
-    let state = AppState { config, client };
+    let (usage_recorder, usage_query) = match &config.usage {
+        Some(usage) => {
+            let dir = PathBuf::from(&usage.dir);
+            let recorder = UsageRecorder::spawn(dir.clone(), usage.retention_days)
+                .with_context(|| format!("failed to start usage recorder in {}", usage.dir))?;
+            (Some(recorder), Some(Arc::new(UsageQuery::new(dir))))
+        }
+        None => (None, None),
+    };
+
+    let state = AppState { config, client, usage_recorder, usage_query };
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/usage/daily", get(usage_daily))
+        .route("/usage/sessions", get(usage_sessions))
         .route("/v1/messages", post(handle_messages))
         .route("/claude/v1/messages", post(handle_messages))
         .route("/v1/responses", post(handle_responses))
@@ -108,7 +198,7 @@ async fn main() -> Result<()> {
     .context("invalid listen address")?;
 
     log::info!(
-        "startup addr={} config_path={} api_format={} upstream_base_url={} timeout_secs={} model_map_count={} extra_headers_count={} http_proxy_set={} https_proxy_set={} no_proxy_set={}",
+        "startup addr={} config_path={} api_format={} upstream_base_url={} timeout_secs={} model_map_count={} extra_headers_count={} usage_ledger={} http_proxy_set={} https_proxy_set={} no_proxy_set={}",
         addr,
         config_path.display(),
         api_format_name(state.config.upstream.api_format),
@@ -116,6 +206,7 @@ async fn main() -> Result<()> {
         state.config.upstream.timeout_secs,
         state.config.upstream.model_map.len(),
         state.config.upstream.extra_headers.len(),
+        state.config.usage.as_ref().map_or("off", |usage| usage.dir.as_str()),
         env_var_is_set("HTTP_PROXY") || env_var_is_set("http_proxy"),
         env_var_is_set("HTTPS_PROXY") || env_var_is_set("https_proxy"),
         env_var_is_set("NO_PROXY") || env_var_is_set("no_proxy"),
@@ -133,6 +224,89 @@ async fn health() -> impl IntoResponse {
         "status": "ok",
         "service": "cc-proxy",
     }))
+}
+
+#[derive(serde::Deserialize)]
+struct UsageParams {
+    date: Option<String>,
+    env: Option<String>,
+    trace_id: Option<String>,
+}
+
+fn usage_query_response(result: Result<Value, QueryError>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(QueryError::BadRequest(message)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response(),
+        Err(QueryError::Internal(message)) => {
+            log::warn!("usage.query_failed error={}", sanitize_error_message(&message));
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "usage ledger read failed" }))).into_response()
+        }
+    }
+}
+
+async fn run_usage_query(
+    state: AppState,
+    query_fn: impl FnOnce(&UsageQuery) -> Result<Value, QueryError> + Send + 'static,
+) -> Response {
+    let Some(query) = state.usage_query.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let result = tokio::task::spawn_blocking(move || query_fn(&query))
+        .await
+        .unwrap_or_else(|err| Err(QueryError::Internal(err.to_string())));
+    usage_query_response(result)
+}
+
+async fn usage_daily(State(state): State<AppState>, Query(params): Query<UsageParams>) -> Response {
+    run_usage_query(state, move |query| query.daily(params.date.as_deref(), params.env.as_deref())).await
+}
+
+async fn usage_sessions(State(state): State<AppState>, Query(params): Query<UsageParams>) -> Response {
+    run_usage_query(state, move |query| query.sessions(params.date.as_deref(), params.trace_id.as_deref())).await
+}
+
+/// The trace headers to copy onto the upstream request. A header the deployment pins via
+/// `extra_headers` wins — reqwest appends rather than replaces, and two values for one
+/// identity header is worse than either.
+fn trace_headers_to_forward(
+    incoming: &HeaderMap,
+    extra_headers: &std::collections::HashMap<String, String>,
+) -> Vec<(&'static str, HeaderValue)> {
+    usage::FORWARDED_TRACE_HEADERS
+        .iter()
+        .filter(|name| !extra_headers.keys().any(|key| key.eq_ignore_ascii_case(name)))
+        .filter_map(|name| incoming.get(*name).map(|value| (*name, value.clone())))
+        .collect()
+}
+
+/// Mirrors the routing in `resolve_upstream_and_body`, for the ledger only.
+fn resolved_provider_name(body: &Value, config: &ProxyConfig, provider_from_path: Option<&str>) -> Option<String> {
+    if let Some(provider) = provider_from_path.filter(|provider| config.providers.contains_key(*provider)) {
+        return Some(provider.to_string());
+    }
+    let (provider, _) = body.get("model")?.as_str()?.split_once('/')?;
+    config.providers.contains_key(provider).then(|| provider.to_string())
+}
+
+fn build_usage_tracking(
+    state: &AppState,
+    headers: &HeaderMap,
+    provider: Option<String>,
+    is_stream: bool,
+    requested_model: Option<&str>,
+    mapped_model: Option<&str>,
+) -> Option<Arc<UsageTracking>> {
+    let recorder = state.usage_recorder.clone()?;
+    Some(Arc::new(UsageTracking::new(
+        recorder,
+        UsageMeta {
+            provider,
+            stream: is_stream,
+            requested_model: requested_model.map(str::to_string),
+            mapped_model: mapped_model.map(str::to_string),
+            identity: RequestIdentity::from_headers(headers),
+        },
+    )))
 }
 
 async fn handle_messages(
@@ -183,6 +357,7 @@ async fn handle_messages_internal(
         .and_then(|value| value.as_array())
         .map_or(0, |tools| tools.len());
 
+    let provider_name = resolved_provider_name(&request_body, &state.config, provider_from_path.as_deref());
     let (upstream, request_body) = resolve_upstream_and_body(request_body, &state.config, provider_from_path.as_deref());
 
     let mut mapped_body = apply_model_mapping(request_body, &upstream.model_map, upstream.default_model.as_deref());
@@ -197,12 +372,22 @@ async fn handle_messages_internal(
         .map(str::to_string);
     let api_format = upstream.api_format;
     let api_format_name = api_format_name(api_format);
+    let usage = build_usage_tracking(
+        &state,
+        &parts.headers,
+        provider_name,
+        is_stream,
+        requested_model.as_deref(),
+        mapped_model.as_deref(),
+    );
     let request_context = RequestLogContext {
         req_id,
         path: path.clone(),
         api_format: api_format_name,
         started_at,
+        usage,
     };
+    let mut usage_guard = UsageGuard::new(request_context.clone());
 
     log_request_start(
         req_id,
@@ -226,7 +411,7 @@ async fn handle_messages_internal(
             upstream.prompt_cache_key.as_deref(),
         ),
     }
-    .map_err(|err| internal_error_with_context(req_id, &path, "transform_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+    .map_err(|err| request_context.internal_error("transform_request", is_stream, err))?;
 
     let transformed_body = apply_extra_body(req_id, transformed_body, &upstream.extra_body);
 
@@ -237,7 +422,7 @@ async fn handle_messages_internal(
     let upstream_url = build_upstream_url(&upstream.base_url, endpoint);
 
     let payload = serde_json::to_vec(&transformed_body)
-        .map_err(|err| internal_error_with_context(req_id, &path, "serialize_upstream_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+        .map_err(|err| request_context.internal_error("serialize_upstream_request", is_stream, err))?;
     let api_key = get_request_api_key(&parts.headers)
         .unwrap_or_else(|| upstream.api_key.clone());
     let mut upstream_request = state
@@ -249,6 +434,9 @@ async fn handle_messages_internal(
         .header("accept-encoding", "identity")
         .body(payload);
 
+    for (name, value) in trace_headers_to_forward(&parts.headers, &upstream.extra_headers) {
+        upstream_request = upstream_request.header(name, value);
+    }
     for (name, value) in &upstream.extra_headers {
         upstream_request = upstream_request.header(name, value);
     }
@@ -264,7 +452,7 @@ async fn handle_messages_internal(
     let upstream_response = upstream_request
         .send()
         .await
-        .map_err(|err| upstream_transport_error_with_context(req_id, &path, api_format_name, is_stream, started_at, err))?;
+        .map_err(|err| request_context.transport_error(is_stream, err))?;
     let upstream_status = upstream_response.status();
 
     if !upstream_status.is_success() {
@@ -280,6 +468,7 @@ async fn handle_messages_internal(
             started_at.elapsed().as_millis(),
             sanitize_error_message(&message),
         );
+        request_context.record(Outcome::UpstreamError, Some(upstream_status.as_u16()), TokenCounts::default(), None);
         return Err(anthropic_error_response(upstream_status, &message));
     }
 
@@ -301,20 +490,22 @@ async fn handle_messages_internal(
         headers.insert("content-type", HeaderValue::from_static("text/event-stream"));
         headers.insert("cache-control", HeaderValue::from_static("no-cache"));
         headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        // The stream owns settlement from here, with its own guard for client aborts.
+        usage_guard.disarm();
         return Ok((headers, Body::from_stream(anthropic_stream)).into_response());
     }
 
     let upstream_body = upstream_response
         .bytes()
         .await
-        .map_err(|err| upstream_transport_error_with_context(req_id, &path, api_format_name, is_stream, started_at, err))?;
+        .map_err(|err| request_context.transport_error(is_stream, err))?;
     let parsed: Value = serde_json::from_slice(&upstream_body)
-        .map_err(|err| internal_error_with_context(req_id, &path, "parse_upstream_json", Some(api_format_name), Some(is_stream), started_at, err))?;
+        .map_err(|err| request_context.internal_error("parse_upstream_json", is_stream, err))?;
     let anthropic_body = match api_format {
         ApiFormat::OpenAiChat => transform::openai_to_anthropic(parsed),
         ApiFormat::OpenAiResponses => transform_responses::responses_to_anthropic(parsed),
     }
-    .map_err(|err| internal_error_with_context(req_id, &path, "transform_upstream_response", Some(api_format_name), Some(is_stream), started_at, err))?;
+    .map_err(|err| request_context.internal_error("transform_upstream_response", is_stream, err))?;
 
     log_request_done(&request_context, upstream_status, &summarize_anthropic_response(&anthropic_body), false);
 
@@ -371,6 +562,7 @@ async fn handle_responses_internal(
         .and_then(|value| value.as_array())
         .map_or(0, |tools| tools.len());
 
+    let provider_name = resolved_provider_name(&request_body, &state.config, provider_from_path.as_deref());
     let (upstream, request_body) = resolve_upstream_and_body(request_body, &state.config, provider_from_path.as_deref());
 
     let mapped_body = apply_model_mapping(request_body, &upstream.model_map, upstream.default_model.as_deref());
@@ -379,12 +571,22 @@ async fn handle_responses_internal(
         .and_then(|value| value.as_str())
         .map(str::to_string);
     let api_format_name = "responses_to_openai_chat";
+    let usage = build_usage_tracking(
+        &state,
+        &parts.headers,
+        provider_name,
+        is_stream,
+        requested_model.as_deref(),
+        mapped_model.as_deref(),
+    );
     let request_context = RequestLogContext {
         req_id,
         path: path.clone(),
         api_format: api_format_name,
         started_at,
+        usage,
     };
+    let mut usage_guard = UsageGuard::new(request_context.clone());
 
     log_request_start(
         req_id,
@@ -398,11 +600,11 @@ async fn handle_responses_internal(
     );
 
     let transformed_body = transform_responses::responses_request_to_openai_chat(mapped_body)
-        .map_err(|err| internal_error_with_context(req_id, &path, "transform_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+        .map_err(|err| request_context.internal_error("transform_request", is_stream, err))?;
     let transformed_body = apply_extra_body(req_id, transformed_body, &upstream.extra_body);
     let upstream_url = build_upstream_url(&upstream.base_url, "/chat/completions");
     let payload = serde_json::to_vec(&transformed_body)
-        .map_err(|err| internal_error_with_context(req_id, &path, "serialize_upstream_request", Some(api_format_name), Some(is_stream), started_at, err))?;
+        .map_err(|err| request_context.internal_error("serialize_upstream_request", is_stream, err))?;
     let api_key = get_request_api_key(&parts.headers)
         .unwrap_or_else(|| upstream.api_key.clone());
     let mut upstream_request = state
@@ -414,6 +616,9 @@ async fn handle_responses_internal(
         .header("accept-encoding", "identity")
         .body(payload);
 
+    for (name, value) in trace_headers_to_forward(&parts.headers, &upstream.extra_headers) {
+        upstream_request = upstream_request.header(name, value);
+    }
     for (name, value) in &upstream.extra_headers {
         upstream_request = upstream_request.header(name, value);
     }
@@ -429,7 +634,7 @@ async fn handle_responses_internal(
     let upstream_response = upstream_request
         .send()
         .await
-        .map_err(|err| upstream_transport_error_with_context(req_id, &path, api_format_name, is_stream, started_at, err))?;
+        .map_err(|err| request_context.transport_error(is_stream, err))?;
     let upstream_status = upstream_response.status();
 
     if !upstream_status.is_success() {
@@ -445,6 +650,7 @@ async fn handle_responses_internal(
             started_at.elapsed().as_millis(),
             sanitize_error_message(&message),
         );
+        request_context.record(Outcome::UpstreamError, Some(upstream_status.as_u16()), TokenCounts::default(), None);
         return Err(openai_error_response(upstream_status, &message));
     }
 
@@ -461,17 +667,19 @@ async fn handle_responses_internal(
         headers.insert("content-type", HeaderValue::from_static("text/event-stream"));
         headers.insert("cache-control", HeaderValue::from_static("no-cache"));
         headers.insert("connection", HeaderValue::from_static("keep-alive"));
+        // The stream owns settlement from here, with its own guard for client aborts.
+        usage_guard.disarm();
         return Ok((headers, Body::from_stream(responses_stream)).into_response());
     }
 
     let upstream_body = upstream_response
         .bytes()
         .await
-        .map_err(|err| upstream_transport_error_with_context(req_id, &path, api_format_name, is_stream, started_at, err))?;
+        .map_err(|err| request_context.transport_error(is_stream, err))?;
     let parsed: Value = serde_json::from_slice(&upstream_body)
-        .map_err(|err| internal_error_with_context(req_id, &path, "parse_upstream_json", Some(api_format_name), Some(is_stream), started_at, err))?;
+        .map_err(|err| request_context.internal_error("parse_upstream_json", is_stream, err))?;
     let responses_body = transform_responses::openai_chat_to_responses(parsed)
-        .map_err(|err| internal_error_with_context(req_id, &path, "transform_upstream_response", Some(api_format_name), Some(is_stream), started_at, err))?;
+        .map_err(|err| request_context.internal_error("transform_upstream_response", is_stream, err))?;
 
     log_request_done(&request_context, upstream_status, &summarize_responses_response(&responses_body), false);
 
@@ -650,6 +858,18 @@ pub(crate) fn log_request_done(
         summary.has_thinking,
         summary.thinking_chars,
         summary.text_chars,
+    );
+    context.record(
+        Outcome::Done,
+        Some(status.as_u16()),
+        TokenCounts::from_parts(
+            summary.input_tokens,
+            summary.output_tokens,
+            summary.cache_read_input_tokens,
+            summary.cache_creation_input_tokens,
+            context.input_includes_cache(),
+        ),
+        summary.response_model.as_deref(),
     );
 }
 
@@ -964,6 +1184,25 @@ fn resolve_upstream_and_body<'a>(
 #[cfg(test)]
 mod main_tests {
     use super::*;
+
+    #[test]
+    fn only_trace_headers_are_forwarded_and_extra_headers_win() {
+        let mut incoming = HeaderMap::new();
+        incoming.insert("x-trace-identifier", HeaderValue::from_static("alice"));
+        incoming.insert("x-trace-identifier-type", HeaderValue::from_static("oa"));
+        incoming.insert("x-cura-session-id", HeaderValue::from_static("s1"));
+        incoming.insert("x-cura-env", HeaderValue::from_static("prod"));
+
+        let forwarded = trace_headers_to_forward(&incoming, &HashMap::new());
+        let names: Vec<_> = forwarded.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["x-trace-identifier", "x-trace-identifier-type"]);
+
+        let pinned = HashMap::from([("X-Trace-Identifier-Type".to_string(), "portal".to_string())]);
+        let forwarded = trace_headers_to_forward(&incoming, &pinned);
+        let names: Vec<_> = forwarded.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, vec!["x-trace-identifier"]);
+    }
+
     use crate::config::{ListenConfig, UpstreamConfig, ApiFormat};
     use axum::http::HeaderMap;
     use std::collections::HashMap;
@@ -1110,6 +1349,7 @@ mod main_tests {
             listen: ListenConfig { host: "127.0.0.1".to_string(), port: 8080 },
             upstream: default_upstream.clone(),
             providers,
+            usage: None,
         };
 
         // 1. No provider prefix

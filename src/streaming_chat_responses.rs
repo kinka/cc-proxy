@@ -1,7 +1,8 @@
 use crate::sse::strip_sse_field;
 use crate::transform::{DeltaToolCall, OpenAIStreamChunk};
 use crate::transform_responses::openai_chat_usage_to_responses_usage;
-use crate::{log_request_done, RequestLogContext, ResponseLogSummary};
+use crate::usage::{Outcome, TokenCounts};
+use crate::{log_request_done, RequestLogContext, ResponseLogSummary, UsageGuard};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
@@ -40,6 +41,9 @@ pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'stat
         let mut pending_finish_reason: Option<String> = None;
         let mut logged_completion = false;
 
+        // Settles `client_aborted` if the caller drops the body before any terminal path runs.
+        let mut usage_guard = UsageGuard::new(request_context.clone());
+
         tokio::pin!(stream);
 
         while let Some(chunk) = stream.next().await {
@@ -54,6 +58,7 @@ pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'stat
                         request_context.started_at.elapsed().as_millis(),
                         err,
                     );
+                    request_context.record(Outcome::TransportError, Some(200), usage_guard.partial, usage_guard.response_model.as_deref());
                     yield Err(std::io::Error::other(err.to_string()));
                     continue;
                 }
@@ -177,6 +182,8 @@ pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'stat
                             usage_value["prompt_tokens_details"] = json!({ "cached_tokens": details.cached_tokens });
                         }
                         pending_usage = openai_chat_usage_to_responses_usage(Some(&usage_value));
+                        usage_guard.partial = TokenCounts::from_responses_usage(&pending_usage);
+                        usage_guard.response_model = current_model.clone();
                     }
 
                     let Some(choice) = parsed.choices.first() else {
@@ -356,6 +363,7 @@ pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'stat
             }
             yield Ok(Bytes::from("data: [DONE]\n\n"));
 
+            request_context.record(Outcome::StreamTruncated, Some(200), usage_guard.partial, current_model.as_deref());
             log::error!(
                 "request.error req_id={} path={} stage=stream_truncated api_format={} stream=true latency_ms={} response_id={} response_model={} finish_reason={} has_tool_use={} text_chars={} trailing_bytes={} error=upstream stream ended without [DONE]",
                 request_context.req_id,
@@ -501,7 +509,6 @@ fn sse_event(event: &str, data: Value) -> Bytes {
 mod tests {
     use super::*;
     use futures::TryStreamExt;
-    use std::time::Instant;
 
     #[tokio::test]
     async fn chat_stream_emits_completed_output_item_and_response_output() {
@@ -510,12 +517,7 @@ mod tests {
             Ok::<_, std::io::Error>(Bytes::from("data: {\"id\":\"chatcmpl_1\",\"model\":\"test-model\",\"choices\":[{\"delta\":{\"content\":\"llo\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2}}\n\n")),
             Ok::<_, std::io::Error>(Bytes::from("data: [DONE]\n\n")),
         ]);
-        let context = RequestLogContext {
-            req_id: 1,
-            path: "/v1/responses".to_string(),
-            api_format: "responses_to_openai_chat",
-            started_at: Instant::now(),
-        };
+        let context = RequestLogContext::for_test("/v1/responses", "responses_to_openai_chat");
 
         let body = create_responses_sse_stream_from_chat(chunks, context)
             .try_fold(String::new(), |mut body, bytes| async move {
@@ -538,12 +540,7 @@ mod tests {
                 .into_iter()
                 .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
         );
-        let context = RequestLogContext {
-            req_id: 1,
-            path: "/v1/responses".to_string(),
-            api_format: "responses_to_openai_chat",
-            started_at: Instant::now(),
-        };
+        let context = RequestLogContext::for_test("/v1/responses", "responses_to_openai_chat");
         create_responses_sse_stream_from_chat(stream, context)
             .try_fold(String::new(), |mut body, bytes| async move {
                 body.push_str(&String::from_utf8(bytes.to_vec()).unwrap());

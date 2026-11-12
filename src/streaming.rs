@@ -2,7 +2,8 @@ use crate::sse::strip_sse_field;
 use crate::transform::{
     compute_anthropic_input_tokens, extract_cache_read_tokens, DeltaToolCall, OpenAIStreamChunk,
 };
-use crate::{log_request_done, RequestLogContext};
+use crate::usage::{Outcome, TokenCounts};
+use crate::{log_request_done, RequestLogContext, UsageGuard};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::json;
@@ -45,6 +46,9 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
         let mut sent_message_stop = false;
         let mut pending_finish_reason: Option<&'static str> = None;
 
+        // Settles `client_aborted` if the caller drops the body before any terminal path runs.
+        let mut usage_guard = UsageGuard::new(request_context.clone());
+
         tokio::pin!(stream);
 
         while let Some(chunk) = stream.next().await {
@@ -59,6 +63,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                         request_context.started_at.elapsed().as_millis(),
                         err,
                     );
+                    request_context.record(Outcome::TransportError, Some(200), usage_guard.partial, usage_guard.response_model.as_deref());
                     yield Err(std::io::Error::other(err.to_string()));
                     continue;
                 }
@@ -147,6 +152,8 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                         if let Some(created) = cache_creation {
                             pending_usage["cache_creation_input_tokens"] = json!(created);
                         }
+                        usage_guard.partial = TokenCounts::from_anthropic_usage(&pending_usage, request_context.input_includes_cache());
+                        usage_guard.response_model = current_model.clone();
                     }
 
                     let Some(choice) = parsed.choices.first() else {
@@ -365,6 +372,7 @@ pub fn create_anthropic_sse_stream<E: std::error::Error + Send + 'static>(
                 yield Ok(Bytes::from(format!("event: error\ndata: {}\n\n", serde_json::to_string(&event).unwrap_or_default())));
             }
 
+            request_context.record(Outcome::StreamTruncated, Some(200), usage_guard.partial, current_model.as_deref());
             log::error!(
                 "request.error req_id={} path={} stage=stream_truncated api_format={} stream=true latency_ms={} response_id={} response_model={} finish_reason={} sent_message_start={} has_tool_use={} has_thinking={} thinking_chars={} text_chars={} trailing_bytes={} error=upstream stream ended without [DONE]",
                 request_context.req_id,
@@ -416,7 +424,6 @@ fn update_tool_state(state: &mut ToolBlockState, tool_call: &DeltaToolCall) {
 mod tests {
     use super::*;
     use crate::RequestLogContext;
-    use std::time::Instant;
 
     fn collect(chunks: Vec<&'static str>) -> String {
         let stream = futures::stream::iter(
@@ -424,12 +431,7 @@ mod tests {
                 .into_iter()
                 .map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))),
         );
-        let context = RequestLogContext {
-            req_id: 1,
-            path: "/v1/messages".to_string(),
-            api_format: "openai_chat",
-            started_at: Instant::now(),
-        };
+        let context = RequestLogContext::for_test("/v1/messages", "openai_chat");
         let out = create_anthropic_sse_stream(stream, context);
         futures::executor::block_on(async move {
             futures::pin_mut!(out);
@@ -439,6 +441,60 @@ mod tests {
             }
             acc
         })
+    }
+
+    fn drain(out: impl Stream<Item = Result<Bytes, std::io::Error>>) {
+        futures::executor::block_on(async move {
+            futures::pin_mut!(out);
+            while out.next().await.is_some() {}
+        });
+    }
+
+    fn chunks(chunks: Vec<&'static str>) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+        futures::stream::iter(chunks.into_iter().map(|chunk| Ok::<_, std::io::Error>(Bytes::from(chunk))))
+    }
+
+    const USAGE_CHUNK: &str = "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":60}}}\n\n";
+
+    #[test]
+    fn completed_stream_records_done_with_cache_inclusive_prompt() {
+        let (context, dir) = crate::usage::tests::tracked_context("/v1/messages", "openai_chat");
+        drain(create_anthropic_sse_stream(chunks(vec![USAGE_CHUNK, "data: [DONE]\n\n"]), context));
+        let records = crate::usage::tests::take_records(dir, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::Done);
+        // Upstream prompt_tokens (100) already includes the 60 cached; the ledger must not double it.
+        assert_eq!(records[0].tokens.prompt_tokens, 100);
+        assert_eq!(records[0].tokens.cache_read_tokens, 60);
+        assert_eq!(records[0].tokens.output_tokens, 7);
+    }
+
+    #[test]
+    fn truncated_stream_keeps_the_usage_it_saw() {
+        let (context, dir) = crate::usage::tests::tracked_context("/v1/messages", "openai_chat");
+        drain(create_anthropic_sse_stream(chunks(vec![USAGE_CHUNK]), context));
+        let records = crate::usage::tests::take_records(dir, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::StreamTruncated);
+        assert_eq!(records[0].tokens.total(), 107);
+    }
+
+    /// The caller hanging up drops the body mid-stream; that request must still be counted.
+    #[test]
+    fn dropping_the_stream_early_records_client_aborted() {
+        let (context, dir) = crate::usage::tests::tracked_context("/v1/messages", "openai_chat");
+        let out = create_anthropic_sse_stream(
+            chunks(vec![USAGE_CHUNK, "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[]}\n\n", "data: [DONE]\n\n"]),
+            context,
+        );
+        futures::executor::block_on(async move {
+            futures::pin_mut!(out);
+            let _ = out.next().await;
+        });
+        let records = crate::usage::tests::take_records(dir, 1);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].outcome, Outcome::ClientAborted);
+        assert_eq!(records[0].tokens.total(), 107);
     }
 
     /// An upstream that closes mid-turn must still produce a terminated Anthropic message;
