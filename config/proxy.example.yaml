@@ -16,12 +16,11 @@ upstream:
     # Internal deployments (`internal-*`) are deliberately not aliased here.
     qwen3.8-flash: "external-qwen3.8-flash"
     qwen3.8-max: "external-qwen3.8-max"
-    glm-5.3-flash: "external-glm5.3-flash"
-    glm5.3-flash: "external-glm5.3-flash"
+    glm-5.3-flash: "external-glm-5.3-flash"
     deepseek-v4-flash: "external-deepseek-v4-flash"
     external-qwen3.8-flash: "external-qwen3.8-flash"
     external-qwen3.8-max: "external-qwen3.8-max"
-    external-glm5.3-flash: "external-glm5.3-flash"
+    external-glm-5.3-flash: "external-glm-5.3-flash"
     external-deepseek-v4-flash: "external-deepseek-v4-flash"
   extra_headers: {}
   # Extra top-level fields merged into the upstream request body, for sampling knobs
